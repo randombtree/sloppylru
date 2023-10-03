@@ -12,6 +12,7 @@ use sled;
 use sled::IVec;
 
 use crate::config::CacheConfig;
+use crate::pagedvec::PagedVec;
 
 
 #[derive(Clone, Copy, Hash, Debug)]
@@ -380,8 +381,6 @@ macro_rules! take_two_refs {
 	    let second = &mut b[0];
 	    let (_a, b) = a.split_at_mut($first);
 	    let first  = &mut b[0];
-	    // let (a, [second, ..]) = $list.split_at_mut($second);
-	    // let (a, [first, ..])  = a.split_at_mut($first);
 	    (first, second)
 	}
     };
@@ -407,7 +406,7 @@ where
 [(); N + 2]: Sized
 {
     size:        usize,
-    items:       Vec<LruItem>,
+    items:       PagedVec<LruItem, 4096>,   // TODO: Configurable page size
     levels:      [LevelState;N + 2],
 }
 
@@ -424,8 +423,8 @@ where
 
     pub fn new(config: &CacheConfig<N>) -> Self {
 	let size = config.blocks;
-	//let mut items = Vec::with_capacity(blocks.try_into().unwrap() + N + 2);
-	let items = (0 as usize..(size + Self::LEVELS)).map(|i| {
+	// Vec with room for all items + level heads
+	let items = PagedVec::new(size + Self::LEVELS, move |i| {
 	    let (prev, next) = {
 		if i == (size + Self::LEVEL_FREE.0 as usize) {
 		    (size - 1, 0)
@@ -444,10 +443,8 @@ where
 		}
 	    };
 	    // First and last items are linked to the free-list head
-	    // let prev = if i == 0 { size + Self::LEVEL_FREE } else { i - 1 };
-	    // let next = if i == size - 1 { size + Self::LEVEL_FREE } else { i + 1 };
 	    LruItem::new(Slot::from(prev), Slot::from(next), Self::LEVEL_FREE)
-	}).collect();
+	});
 
 	let levels: [LevelState; N + 2] = (0..(N + 2)).map(|i| {
 	    let (max_size, allocated) = {

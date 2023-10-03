@@ -26,6 +26,7 @@ mod cache;
 mod config;
 
 mod lru;
+mod pagedvec;
 pub mod key;
 pub mod manager;
 pub mod result;
