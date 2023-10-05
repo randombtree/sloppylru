@@ -497,37 +497,41 @@ where
 	    let s_head_ndx     = self.size + ndx;
 	    let t_head_ndx     = self.size + ndx - 1;
 
-	    name_index!(s_head, self.items, s_head_ndx);
 	    name_index!(t_head, self.items, t_head_ndx);
+
+	    let mut last_prev_ndx: Option<usize> = None;
 
 	    while s_level.allocated > s_level.max_size {
 		s_level.allocated -= 1;
 		t_level.allocated += 1;
 		balanced += 1;
 		// Take from the tail, give to the head
-		let item_ndx: usize  = s_head!().prev().into();  // The index we are moving one level down
-		let first_ndx: usize = t_head!().next().into();  // The previously first item on target
+		let [t_head, s_head] = self.items.take_refs_mut([t_head_ndx, s_head_ndx]);
+		let item_ndx: usize  = s_head.prev().into();      // The index we are moving one level down
+		let first_ndx: usize = t_head.next().into();      // The previously first item on target
 
 		trace!("Moving item {}", item_ndx);
 
-		name_index!(item, self.items, item_ndx);
-		name_index!(first, self.items, first_ndx);
-		let new_prev = item!().prev();
+		// Can't take t_head here because it might be same as "first"
+		let [item,
+		     first,
+		     s_head] = self.items.take_refs_mut_unsorted([item_ndx, first_ndx, s_head_ndx]);
+		let new_prev_ndx: usize = item.prev().into();
+
+		item.set_next(first_ndx.into());
+		item.set_prev(t_head_ndx.into());
+		item.set_level((ndx - 1).into());
+
+		first.set_prev(item_ndx.into());
+		s_head.set_prev(new_prev_ndx.into());
 		// Update heads
-		s_head!().set_prev(new_prev);
 		t_head!().set_next(item_ndx.into());
-
-		item!().set_next(first_ndx.into());
-		item!().set_prev(t_head_ndx.into());
-		item!().set_level((ndx - 1).into());
-
-		first!().set_prev(item_ndx.into());
 		// NB: Fixup 'source tail' later on when writing to array, as we only need to do it once
 		// after all items are balanced
-
+		last_prev_ndx = Some(new_prev_ndx);
 	    }
 	    // As noted above, the last item remaining on the source level must have its next ptr fixed
-	    let last_ndx: usize = s_head!().prev().into();
+	    let last_ndx = last_prev_ndx.unwrap();
 	    self.items[last_ndx].set_next(s_head_ndx.into());
 	    trace!("Balanced {} items on level {}", balanced, ndx);
 	}
