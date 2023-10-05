@@ -767,5 +767,8 @@ mod tests {
 	assert!(compare_level(&l2_slots, lru.level_iter::<L2>()));
 	assert!(compare_level(&l3_slots, lru.level_iter::<L3>()));
 
+	// Promote again; This must also be checked for!
+	lru.promote(l2_promote, Some(1));
+	assert!(compare_level(&l2_slots, lru.level_iter::<L2>()));
     }
 }
