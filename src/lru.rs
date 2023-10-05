@@ -608,26 +608,30 @@ where
 	self.levels[usize::from(t_level)].allocated += 1;
 	// Installing item at target head
 	let t_head_ndx = self.level_head(t_level);
-	name_index!(t_head, self.items, t_head_ndx);
+	let [item, t_head] = self.items.take_refs_mut([item_ndx, t_head_ndx]);
+	let old_top_ndx: usize = t_head.next().into();
+	if old_top_ndx == item_ndx {
+	    trace!("Item already at top of level");
+	    return;
+	}
+
+	// Store old indexes for item
+	let prev_ndx: usize = item.prev().into();
+	let next_ndx: usize = item.next().into();
+
+	// And then insert item at H <-> I <-> O
+	item.set_prev(t_head_ndx.into());
+	item.set_next(old_top_ndx.into());
+	item.set_level(t_level);
+	t_head.set_next(item_ndx.into());
+	name_index!(old_top, self.items, old_top_ndx);
+	old_top!().set_prev(slot);
 
 	// Patch hole P <-> (I) <-> N
-	let prev_ndx = usize::from(item!().prev());
-	let next_ndx = usize::from(item!().next());
 	name_index!(prev, self.items, prev_ndx);
 	name_index!(next, self.items, next_ndx);
 	prev!().set_next(next_ndx.into());
 	next!().set_prev(prev_ndx.into());
-
-	// And then insert item at H <-> I <-> O
-	let old_top_ndx = usize::from(t_head!().next());
-	name_index!(old_top, self.items, old_top_ndx);
-	old_top!().set_prev(slot);
-	t_head!().set_next(slot);
-
-	// And update item
-	item!().set_prev(t_head_ndx.into());
-	item!().set_next(old_top_ndx.into());
-	item!().set_level(t_level);
     }
 
     /// Iterator from high->low
