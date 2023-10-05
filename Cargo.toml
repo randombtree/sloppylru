@@ -16,4 +16,5 @@ bit-vec = "0.6"
 speculate = "0.1"
 env_logger = "0.8"
 smol = "1.3.0"     # For testing async methods
+test-log = "0.2"
 

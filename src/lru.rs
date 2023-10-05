@@ -662,7 +662,8 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use log::{ trace};
+    use log::{ trace };
+    use test_log::test;
 
     use super::{LruArray, Slot};
     use crate::config::CacheConfig;
