@@ -359,6 +359,34 @@ where
 	}
     }
 
+    /// Like take_refs_mut but does the extra work to allow unsorted indexes
+    pub fn take_refs_mut_unsorted<'a, const S: usize>(&'a mut self, indexes: [usize; S]) -> [&'a mut T;S]
+    {
+	// Store original order
+	let mut remap = {
+	    let mut i = 0;
+	    indexes.map(|index| {
+		let ret = (i, index); i+= 1; ret
+	    })
+	};
+	remap.sort_by_key(|item| item.1); // Sort by array index
+	let sorted_indexes: [usize; S] = std::array::from_fn(|ndx| remap[ndx].1);
+
+	// Now need to map order back to what was given
+	let mut refs = {
+	    let mut i = 0;
+	    self.take_refs_mut(sorted_indexes).map(|mutref| {
+		// Remap has the original order stored in the tuple
+		let ret = (remap[i].0, mutref);
+		i += 1;
+		ret
+	    })
+	};
+	refs.sort_by_key(|item| item.0);
+
+	refs.map(|(_ndx, mutref)| mutref)
+    }
+
     /// Takes shadow pages for the indexes specified.
     /// The indexes must be sorted!
     /// It's assumed that the caller has tracked changes to the indexes and now wants
@@ -479,15 +507,28 @@ mod tests {
 
     #[test]
     #[should_panic]
-    fn test_take_refs_invalid() {
+    fn test_take_refs_invalid_order() {
 	let mut vec = create_pvec();
 	let [_two, _one] = vec.take_refs_mut([2,1]);
     }
 
     #[test]
+    #[should_panic]
+    fn test_take_refs_duplicates() {
+	let mut vec = create_pvec();
+	let [_one1, _one2] = vec.take_refs_mut([1,1]);
+    }
+
+
+    #[test]
     fn test_take_refs() {
 	let mut vec = create_pvec();
 	let [one, two, three] = vec.take_refs_mut([1,2,3]);
+	assert!(one.foo == 1);
+	assert!(two.foo == 2);
+	assert!(three.foo == 3);
+
+	let [two, one, three] = vec.take_refs_mut_unsorted([2,1,3]);
 	assert!(one.foo == 1);
 	assert!(two.foo == 2);
 	assert!(three.foo == 3);
