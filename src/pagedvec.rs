@@ -22,7 +22,7 @@ use bit_vec::BitVec;
 /// Also lifetime tracing for main memory (see Drop impl).
 struct ShadowRegisterInner<T, const N: usize>
 where
-    T: Sized  + Clone,
+    T: Sized  + Clone + 'static,
 [T; N]: Sized,
 {
     /// The shadowed pages are actively being used (e.g. written to nv-storage).
@@ -41,7 +41,7 @@ where
 
 impl <T, const N: usize> ShadowRegisterInner<T,N>
 where
-    T: Sized  + Clone,
+    T: Sized  + Clone + 'static,
 [T; N]: Sized,
 {
     /// Current page allocation layout
@@ -126,7 +126,7 @@ where
 
 impl<T, const N: usize> Drop for ShadowRegisterInner<T, N>
     where
-    T: Sized  + Clone,
+    T: Sized  + Clone + 'static,
 {
     fn drop(&mut self) {
 	let layout = Self::memory_layout(self.capacity);
@@ -144,12 +144,12 @@ impl<T, const N: usize> Drop for ShadowRegisterInner<T, N>
 #[derive(Clone)]
 struct ShadowRegister<T, const N: usize>(Arc<Mutex<ShadowRegisterInner<T, N>>>)
 where
-    T: Sized  + Clone,
+    T: Sized  + Clone + 'static,
 [T; N]: Sized;
 
 impl <T, const N: usize> ShadowRegister<T,N>
 where
-    T: Sized  + Clone,
+    T: Sized  + Clone + 'static,
 [T; N]: Sized
 {
 
@@ -220,7 +220,7 @@ where
 
     /// Mark and return pages containing `indexes`, in order.
     /// indexes must be in sort order or we panic!
-    fn grab_shadow_pages(&mut self, indexes: &[usize]) -> Vec<(usize, *const [T;N])> {
+    fn grab_shadow_pages(&mut self, indexes: &[usize]) -> Vec<(usize, *const [u8;N])> {
 	let mut inner = self.0.lock().unwrap();
 	if inner.shadow_active {
 	    panic!("Only one shadow can be active at a time!");
@@ -228,9 +228,10 @@ where
 	// Make sure no pages lay around
 	// Unsafe: We have &mut self, so no references can be active at the time
 	unsafe { inner.maybe_consolidate(); }
+	let base_ptr = inner.ptr.as_ptr();
 	let mut last_ndx: Option<usize> = None;
-	let mut last_page: Option<(usize, *const [T;N])> = None;
-	let vec: Vec<(usize, *const [T;N])> = indexes.iter().map(|index| {
+	let mut last_page: Option<(usize, *const [u8;N])> = None;
+	let vec: Vec<(usize, *const [u8;N])> = indexes.iter().map(|index| {
 	    if *index >= inner.capacity {
 		panic!("PagedVec: Index out of bounds! {} >= {}", index, inner.capacity);
 	    }
@@ -243,7 +244,10 @@ where
 	    // Unsafe: pgnum checked from index
 	    let ret = match last_page {
 		Some((last_num, _ptr)) if last_num == pgnum => None,
-		_ => Some((pgnum, unsafe { inner.ptr.as_ptr().add(pgnum * Self::ITEM_COUNT) as *const [T;N] }))
+		_ => Some((pgnum, unsafe {
+		    // Unsafe: pgnum checked, get pointer to one page worth of bytes
+		    base_ptr.add(pgnum * Self::ITEM_COUNT) as *const [u8;N]
+		}))
 	    };
 	    if ret.is_some() {
 		last_page = ret;
@@ -261,6 +265,17 @@ where
 	vec
     }
 
+}
+
+/// Decouple shadow content type from actual shadow
+trait ShadowUngrabber {
+    fn ungrab_shadow_pages(&self);
+}
+
+impl<T, const N: usize> ShadowUngrabber for ShadowRegister<T, N>
+where
+    T: Sized  + Clone + 'static,
+[T; N]: Sized {
     fn ungrab_shadow_pages(&self) {
 	let mut inner = self.0.lock().unwrap();
 	if !inner.shadow_active {
@@ -271,9 +286,10 @@ where
     }
 }
 
+
 pub struct PagedVec<T, const N: usize>
 where
-    T: Sized  + Clone,
+    T: Sized  + Clone + 'static,
 [T; N]: Sized,
 {
     /// Memory reference count
@@ -286,7 +302,7 @@ where
 
 impl <T, const N: usize> PagedVec<T,N>
 where
-    T: Sized  + Clone,
+    T: Sized  + Clone + 'static,
 [T; N]: Sized,
 {
     pub fn new<F>(capacity: usize, mut initializer: F) -> PagedVec<T,N>
@@ -393,29 +409,29 @@ where
     /// to write out the pages containing the indexes to stable storage.
     /// Returns `ShadowPages` that contains the references to the pages. Only one set
     ///         of ShadowPages can be present at the moment and will panic! if another set is active!
-    pub fn take_shadow_pages(&mut self, indexes: &[usize]) -> ShadowPages<T, N> {
+    pub fn take_shadow_pages(&mut self, indexes: &[usize]) -> ShadowPages<N> {
 	let pages = self.shadow.grab_shadow_pages(indexes);
-	ShadowPages::new(self.shadow.clone(), pages)
+	ShadowPages::new(Box::new(self.shadow.clone()), pages)
     }
 }
 
 // PagedVec can safely be sent to other threads, no thread local storage used.
 unsafe impl<T: Send, const N: usize> Send for PagedVec<T, N>
     where
-    T: Sized  + Clone,
+    T: Sized  + Clone + 'static,
 [T; N]: Sized,
 {}
 
 /// PagedVec references can be shared between threads.
 unsafe impl<T: Sync, const N: usize> Sync for PagedVec<T, N>
     where
-    T: Sized  + Clone,
+    T: Sized  + Clone + 'static,
 [T; N]: Sized,
 {}
 
 impl<T, const N: usize> Index<usize> for PagedVec<T, N>
     where
-    T: Sized  + Clone,
+    T: Sized  + Clone + 'static,
 [T; N]: Sized,
 {
     type Output = T;
@@ -426,7 +442,7 @@ impl<T, const N: usize> Index<usize> for PagedVec<T, N>
 
 impl<T, const N: usize> IndexMut<usize> for PagedVec<T, N>
     where
-    T: Sized  + Clone,
+    T: Sized  + Clone + 'static,
 [T; N]: Sized,
 {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
@@ -435,38 +451,30 @@ impl<T, const N: usize> IndexMut<usize> for PagedVec<T, N>
 }
 
 
-pub struct ShadowPages<T, const N: usize>
-where
-    T: Sized  + Clone,
-[T; N]: Sized,
+pub struct ShadowPages<const N: usize>
 {
     /// Lock the shadow memory in place while we exist
-    shadow: ShadowRegister<T,N>,
+    shadow: Box<dyn ShadowUngrabber>,
     /// The shadow pages, with pointer to the above memory
-    pages: Vec<(usize, *const [T;N])>,
+    pages: Vec<(usize, *const [u8;N])>,
 }
 
-impl <T, const N: usize> ShadowPages<T,N>
-where
-    T: Sized  + Clone,
-[T; N]: Sized,
+impl <const N: usize> ShadowPages<N>
 {
-    fn new(shadow: ShadowRegister<T,N>, pages: Vec<(usize, *const [T;N])>) -> ShadowPages<T,N> {
+    fn new(shadow: Box<dyn ShadowUngrabber>, pages: Vec<(usize, *const [u8;N])>) -> ShadowPages<N> {
 	ShadowPages {
 	    shadow,
 	    pages,
 	}
     }
 
-    pub fn as_slice<'a>(&'a self) -> &'a [(usize, &'a[T;N])] {
+    pub fn as_slice<'a>(&'a self) -> &'a [(usize, &'a[u8;N])] {
 	// Unsafe: Convert pointer to reference
 	unsafe { std::mem::transmute(self.pages.as_slice()) }
     }
 }
 
-impl<T, const N: usize> Drop for ShadowPages<T, N>
-    where
-    T: Sized  + Clone,
+impl<const N: usize> Drop for ShadowPages<N>
 {
     fn drop(&mut self) {
 	self.shadow.ungrab_shadow_pages();
@@ -555,9 +563,15 @@ mod tests {
 	    ($pages:ident) => {
 		// The page references themselves are correct, page contents match
 		for (ndx, pg) in $pages {
+		    assert!(pg.len() == PAGE_SIZE);
+		    // Unsafe: We know there are ITEMS_PER_PAGE struct items..
+		    let pg: &[TestStruct; ITEMS_PER_PAGE]
+			= unsafe { std::mem::transmute(*pg) };
+
 		    let start_index = ndx * ITEMS_PER_PAGE;
 		    let end_index = start_index + ITEMS_PER_PAGE - 1;
 		    for (pgindex, index) in (start_index ..=end_index).enumerate() {
+			//println!("{} {} {} {}", ndx, pgindex, index, pg[pgindex].foo);
 			assert!(index == pg[pgindex].foo);
 		    }
 		}
