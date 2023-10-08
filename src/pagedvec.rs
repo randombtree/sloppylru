@@ -558,10 +558,10 @@ mod tests {
     const PAGE_SIZE: usize = 4096;
     const ITEMS_PER_PAGE: usize = PAGE_SIZE / std::mem::size_of::<TestStruct>();
     const PAGES: usize = 10;
+    const CAPACITY: usize = PAGES * ITEMS_PER_PAGE;
 
     type PVec = PagedVec<TestStruct, PAGE_SIZE>;
     fn create_pvec() -> PVec {
-	const CAPACITY: usize = PAGES * ITEMS_PER_PAGE;
 	PagedVec::<TestStruct, PAGE_SIZE>::new(CAPACITY, |foo| TestStruct {foo})
     }
 
@@ -576,6 +576,31 @@ mod tests {
     fn test_create() {
 	let vec = create_pvec();
 	assert_contents(&vec);
+    }
+
+    #[test]
+    fn test_index_write() {
+	let mut vec = create_pvec();
+	for i in 0..100 {
+	    vec[i].foo = i + 100;
+	}
+	for i in 0..100 {
+	    assert!(vec[i].foo == i + 100);
+	}
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_index_out_of_bounds_read() {
+	let vec = create_pvec();
+	let _val = vec[CAPACITY].foo;
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_index_out_of_bounds_write() {
+	let mut vec = create_pvec();
+	vec[CAPACITY].foo = 1000;
     }
 
     #[test]
