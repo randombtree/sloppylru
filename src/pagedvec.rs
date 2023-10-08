@@ -10,6 +10,7 @@ use std::ptr;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
+use std::iter::Iterator;
 
 use log::{
     trace,
@@ -266,7 +267,6 @@ where
 	}
 	vec
     }
-
 }
 
 /// Decouple shadow content type from actual shadow
@@ -285,6 +285,31 @@ where
 	}
 	inner.shadow_active = false;
 	// Thats all folks! (consolidation happens in safer context).
+    }
+}
+
+/// Another shadow page decoupler, this time for iterating pages
+trait PageGetter<const N: usize> {
+    fn get_page(&self, index: usize) -> Option<*const u8>;
+}
+
+impl<T, const N: usize> PageGetter<N> for ShadowRegister<T, N>
+where
+    T: Sized  + Clone + 'static,
+{
+    fn get_page(&self, pg_index: usize) -> Option<*const u8> {
+	let mut inner = self.0.lock().unwrap();
+	let byte_offset = Self::ITEM_COUNT * pg_index;
+	if byte_offset >= inner.capacity {
+	    return None;
+	}
+	let ptr = match inner.get_page_ptr(pg_index) {
+	    Some(ptr) => ptr,
+	    // Unsafe: Byte offset checked
+	    _ => unsafe { inner.ptr.as_ptr().add(pg_index * Self::ITEM_COUNT) }
+	};
+	// Unsafe: Guaranteed safe due to allocation granularity
+	unsafe { Some(std::mem::transmute(ptr)) }
     }
 }
 
@@ -405,6 +430,12 @@ where
 	refs.map(|(_ndx, mutref)| mutref)
     }
 
+    /// Get a page iterator for write-output purposes.
+    pub fn page_iter<'a>(&'a self) -> PageIter<'a, &'a PagedVec<T, N>, N> {
+	let shadow = Box::new(self.shadow.clone());
+	PageIter::new(shadow)
+    }
+
     /// Takes shadow pages for the indexes specified.
     /// The indexes must be sorted!
     /// It's assumed that the caller has tracked changes to the indexes and now wants
@@ -453,6 +484,36 @@ impl<T, const N: usize> IndexMut<usize> for PagedVec<T, N>
 }
 
 
+pub struct PageIter<'a, T, const N: usize> {
+    getter: Box<dyn PageGetter<N>>,
+    page_index: usize,
+    phantom: std::marker::PhantomData<&'a T>,
+}
+
+impl<'a, T, const N: usize> PageIter<'a, T, N> {
+    fn new(getter: Box<dyn PageGetter<N>>) -> PageIter<'a, T, N> {
+	PageIter {
+	    getter,
+	    page_index: 0,
+	    phantom: std::marker::PhantomData,
+	}
+    }
+}
+
+impl<'a, T, const N: usize> Iterator for PageIter<'a, T, N> {
+    type Item = &'a [u8; N];
+    fn next(&mut self) -> Option<Self::Item> {
+	if let Some(ptr) = self.getter.get_page(self.page_index) {
+	    self.page_index += 1;
+	    // Unsafe: Page is guaranteed to be there, locked by getter.
+	    Some(unsafe { std::mem::transmute(ptr) })
+	} else {
+	    None
+	}
+    }
+}
+
+
 pub struct ShadowPages<const N: usize>
 {
     /// Lock the shadow memory in place while we exist
@@ -485,6 +546,7 @@ impl<const N: usize> Drop for ShadowPages<N>
 
 
 mod tests {
+    use log::trace;
     use super::PagedVec;
 
     #[derive(Clone, Copy)]
@@ -495,10 +557,11 @@ mod tests {
 
     const PAGE_SIZE: usize = 4096;
     const ITEMS_PER_PAGE: usize = PAGE_SIZE / std::mem::size_of::<TestStruct>();
+    const PAGES: usize = 10;
 
     type PVec = PagedVec<TestStruct, PAGE_SIZE>;
     fn create_pvec() -> PVec {
-	const CAPACITY: usize = 10 * PAGE_SIZE;
+	const CAPACITY: usize = PAGES * ITEMS_PER_PAGE;
 	PagedVec::<TestStruct, PAGE_SIZE>::new(CAPACITY, |foo| TestStruct {foo})
     }
 
@@ -607,5 +670,22 @@ mod tests {
 	assert!(vec[0].foo == 0);
 	assert!(vec[1].foo == 1000);
 	assert!(vec[2].foo == 2000);
+    }
+
+    #[test]
+    fn test_page_iter() {
+	let vec = create_pvec();
+	let mut pgcount = 0;
+	for (index, page) in vec.page_iter().enumerate() {
+	    assert!(index < PAGES);
+	    assert!(page.len() == PAGE_SIZE);
+	    pgcount += 1;
+	    let page: &[TestStruct; ITEMS_PER_PAGE] = unsafe { std::mem::transmute(page) };
+	    for (offset, test) in page.iter().enumerate() {
+		trace!("{} {} {}", index, offset, test.foo);
+		assert!(test.foo == ITEMS_PER_PAGE * index + offset);
+	    }
+	}
+	assert!(pgcount == PAGES);
     }
 }
