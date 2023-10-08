@@ -156,8 +156,10 @@ where
     const ITEM_COUNT: usize = N / mem::size_of::<T>();
 
     fn new(capacity: usize, ptr: NonNull<T>) -> ShadowRegister<T, N> {
-	let mut shadowed_pages = BitVec::with_capacity(capacity);
-	shadowed_pages.grow(capacity, false);
+	let pages = capacity / Self::ITEM_COUNT
+	    + { if capacity % Self::ITEM_COUNT > 0 { 1 }  else { 0 } };
+	let mut shadowed_pages = BitVec::with_capacity(pages);
+	shadowed_pages.grow(pages, false);
 	ShadowRegister(Arc::new(Mutex::new(ShadowRegisterInner {
 	    shadow_active: false,
 	    current_present: false,
