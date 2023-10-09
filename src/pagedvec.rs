@@ -51,6 +51,12 @@ where
 	Err(_) => panic!("Bad page size"),
     };
 
+    const ITEMS_PER_PAGE: usize = N / mem::size_of::<T>();
+
+    fn capacity_to_pages(capacity: usize) -> usize {
+	capacity / Self::ITEMS_PER_PAGE + { if capacity % Self::ITEMS_PER_PAGE > 0 { 1 } else { 0 }}
+    }
+
     /// Layout for backing array
     fn memory_layout(capacity: usize) -> Layout {
 	// Allocate page-aligned; the usual alignment should probably
@@ -61,7 +67,7 @@ where
 	// It could be "easy" to do it, but it's not needed ATM:
 	assert!(N & mem::size_of::<T>() == 0, "Non-page aligned item layouts not supported");
 	let size = capacity * mem::size_of::<T>();
-	let aligned_size = size / N * N + N * { if size % N == 0 { 0 } else { 1 }};
+	let aligned_size = N * Self::capacity_to_pages(capacity);
 	trace!("Layout for max {} bytes, {} bytes total", size, aligned_size);
 	Layout::from_size_align(aligned_size, N).unwrap()
     }
@@ -332,20 +338,31 @@ where
     T: Sized  + Clone + 'static,
 [T; N]: Sized,
 {
-    pub fn new<F>(capacity: usize, mut initializer: F) -> PagedVec<T,N>
-    where
-	F: FnMut(usize) -> T,
-    {
+    fn alloc_mem(capacity: usize) -> NonNull<T> {
 	assert!(capacity > 0, "Zero sized PageVec not supported");
 	let layout = ShadowRegisterInner::<T,N>::memory_layout(capacity);
 	// unsafe: Allocation checked with NonNull below
 	let ptr = unsafe {
 	    std::alloc::alloc(layout)
 	};
-	let ptr = match NonNull::new(ptr as *mut T) {
+	match NonNull::new(ptr as *mut T) {
             Some(p) => p,
             None => alloc::handle_alloc_error(layout),
-        };
+        }
+    }
+
+    fn dealloc_mem(capacity: usize, non_null: NonNull<T>) {
+	let layout = ShadowRegisterInner::<T,N>::memory_layout(capacity);
+	unsafe {
+            alloc::dealloc(non_null.as_ptr() as *mut u8, layout);
+        }
+    }
+
+    pub fn new<F>(capacity: usize, mut initializer: F) -> PagedVec<T,N>
+    where
+	F: FnMut(usize) -> T,
+    {
+	let ptr = Self::alloc_mem(capacity);
 	// Initialize data
 	let data_ptr = ptr.as_ptr();
 	for i in 0..capacity {
@@ -357,6 +374,32 @@ where
 	    capacity,
 	    shadow: ShadowRegister::new(capacity, ptr),
 	}
+    }
+
+    /// Initialize PageVec from previously saved pages.
+    pub fn from_loader<F, E>(capacity: usize, mut loader: F) -> Result<PagedVec<T,N>, E>
+    where
+	F: FnMut(usize, &mut [u8; N]) -> Result<(), E>
+    {
+	let non_null = Self::alloc_mem(capacity);
+	let pg_count = ShadowRegisterInner::<T,N>::capacity_to_pages(capacity);
+	let ptr = non_null.as_ptr();
+	for i in 0..pg_count {
+	    // Unsafe: handing out references to each page [u8; N] one page at a time.
+	    //         Transmuting ptr to reference
+	    let ret = loader(i, unsafe {
+		std::mem::transmute(ptr.add(i * ShadowRegisterInner::<T, N>::ITEMS_PER_PAGE))
+	    });
+	    if let Err(e) = ret {
+		trace!("Loader failed, dealloc memory");
+		Self::dealloc_mem(capacity, non_null);
+		return Err(e);
+	    }
+	}
+	Ok(PagedVec {
+	    capacity,
+	    shadow: ShadowRegister::new(capacity, non_null),
+	})
     }
 
     pub fn len(&self) -> usize { self.capacity }
@@ -712,5 +755,34 @@ mod tests {
 	    }
 	}
 	assert!(pgcount == PAGES);
+    }
+
+    #[test]
+    fn test_from_loader() {
+	let vec = create_pvec();
+	let mut iter = vec.page_iter();
+	let mut counter = 0;
+	let loaded_pvec: PVec =  PVec::from_loader(CAPACITY, |ndx, dst| {
+	    let src = iter.next().unwrap();
+	    // Unsafe: Transmute to pointers to make copy happy and do the right thing..
+	    let src: *const u8 = unsafe { std::mem::transmute(src) };
+	    let dst: *mut u8 = unsafe { std::mem::transmute(dst) };
+	    assert!(ndx == counter);
+	    counter += 1;
+	    unsafe {
+		std::ptr::copy_nonoverlapping(src, dst, PAGE_SIZE);
+	    }
+	    Result::<_, &'static str>::Ok(())
+	}).unwrap();
+	assert_contents(&loaded_pvec);
+    }
+
+    #[test]
+    fn test_from_loader_err() {
+	let msg = "expected failure";
+	let loader = PVec::from_loader(CAPACITY, |_ndx, _dst| Err(msg));
+
+	assert!(loader.is_err());
+	assert!(loader.err().unwrap() == msg);
     }
 }
