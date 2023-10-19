@@ -406,6 +406,9 @@ where
 
     pub fn len(&self) -> usize { self.capacity }
 
+    /// Get the number of pages in this PageVec
+    pub fn pages(&self) -> usize { ShadowRegisterInner::<T,N>::capacity_to_pages(self.capacity) }
+
     /// Get reference to item
     pub fn get(&self, ndx: usize) -> Option<&T> {
 	if ndx >= self.capacity {
