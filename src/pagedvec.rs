@@ -268,9 +268,11 @@ where
 	})
 	    .filter_map(std::convert::identity)
 	    .collect();
-	if vec.len() > 0 {
-	    inner.shadow_active = true;
-	}
+
+	// Even if we return a 0-length array, i.e. indexes.len() == 0, we must activate the "shadow"
+	// as it implies that there is a ShadowPages struct that will "free" the shadow pages later.
+	inner.shadow_active = true;
+
 	vec
     }
 }
