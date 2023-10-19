@@ -407,7 +407,7 @@ where
     pub fn len(&self) -> usize { self.capacity }
 
     /// Get reference to item
-    fn get(&self, ndx: usize) -> Option<&T> {
+    pub fn get(&self, ndx: usize) -> Option<&T> {
 	if ndx >= self.capacity {
 	    return None;
 	}
