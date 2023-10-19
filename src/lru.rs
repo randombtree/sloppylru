@@ -11,8 +11,14 @@ use log::{
 use sled;
 use sled::IVec;
 
+use bit_vec::BitVec;
+
 use crate::config::CacheConfig;
-use crate::pagedvec::PagedVec;
+use crate::pagedvec::{
+    PagedVec,
+    PageIter,
+    ShadowPages,
+};
 
 
 #[derive(Clone, Copy, Hash, Debug)]
@@ -189,7 +195,7 @@ impl PartialOrd for Level {
 
 
 /// A packed triplet of slot pointers and level (30 + 30 + 4)
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq)]
 pub(crate) struct LruItem(u64);
 
 
@@ -248,7 +254,7 @@ impl LruItem {
 }
 
 
-#[derive(Clone,Copy, Debug)]
+#[derive(Clone,Copy, Debug, PartialEq)]
 struct LevelState {
     // This is a soft max, only enforced when balancing
     max_size: usize,
@@ -318,9 +324,8 @@ pub(crate) struct LruIterator<'a, const N: usize>
     [(); N + 3]: Sized,  // This guards that we have at least one user level
 [(); N + 2]: Sized
 {
+    index: usize,
     lru: &'a LruArray<N>,
-    level: Level,
-    iter: LevelIterator<'a, N>,
 }
 
 
@@ -331,12 +336,9 @@ impl<'a, const N: usize> LruIterator<'a, N>
 [(); N + 2]: Sized
 {
     fn new(lru: &'a LruArray<N>) -> LruIterator<'a, N> {
-	let level = Level::from(LruArray::LEVEL_USER_START + (N - 1));
-	let iter  = LevelIterator::new(lru, level);
 	LruIterator {
+	    index: 0,
 	    lru,
-	    level,
-	    iter,
 	}
     }
 }
@@ -348,16 +350,101 @@ impl<'a, const N: usize> Iterator for LruIterator<'a, N>
 [(); N + 3]: Sized,  // This guards that we have at least one user level
 [(); N + 2]: Sized
 {
-    type Item = Slot;
+    type Item = &'a LruItem;
     fn next(&mut self) -> Option<Self::Item> {
-	while self.level >= LruArray::LEVEL_USER_START {
-	    if let Some(slot) = self.iter.next() {
-		return Some(slot);
-	    }
-	    self.level -= 1;
-	    self.iter = LevelIterator::new(self.lru, self.level);
+	self.lru.inspect(self.index).and_then(|i| {
+	    self.index += 1;
+	    Some(i)
+	})
+    }
+}
+
+/// Iterator over raw LRU page contents.
+pub struct LruPageIterator<'a, const N: usize>
+    where
+    [(); 14 - N]: Sized, // 4 bits for levels -> 16 - 2 = 14 levels
+[(); N + 3]: Sized,  // This guards that we have at least one user level
+[(); N + 2]: Sized
+{
+    page_iter: PageIter<'a, LruItem, LRU_PAGE_SIZE>,
+    phantom: std::marker::PhantomData<&'a LruArray<N>>,
+}
+
+impl<'a, const N: usize> LruPageIterator<'a, N>
+    where
+    [(); 14 - N]: Sized, // 4 bits for levels -> 16 - 2 = 14 levels
+[(); N + 3]: Sized,  // This guards that we have at least one user level
+[(); N + 2]: Sized
+{
+    fn new(page_iter: PageIter<'a, LruItem, LRU_PAGE_SIZE>) -> LruPageIterator<'a, N> {
+	LruPageIterator {
+	    page_iter,
+	    phantom: std::marker::PhantomData,
 	}
-	None
+    }
+}
+
+impl<'a, const N: usize> Iterator for LruPageIterator<'a, N>
+    where
+    [(); 14 - N]: Sized, // 4 bits for levels -> 16 - 2 = 14 levels
+[(); N + 3]: Sized,  // This guards that we have at least one user level
+[(); N + 2]: Sized
+{
+    type Item = &'a [u8; LRU_PAGE_SIZE];
+    fn next(&mut self) -> Option<Self::Item> {
+	self.page_iter.next()
+    }
+}
+
+
+/// Track changed elements in LRUarray (with page granularity).
+/// Todo: Evaluate performance hit of using HashSet for tracking mask
+///       NB: change_mask eats quite a bit of memory, but it's very cache-line
+///           and branch-predictor efficient when modified.
+struct LruChangeTracker<const N: usize> {
+    change_mask: BitVec,
+    change_set:  Vec<usize>,
+}
+
+impl<const N: usize> LruChangeTracker<N> {
+    const ITEMS_PER_PAGE: usize = LRU_PAGE_SIZE / std::mem::size_of::<LruItem>();
+    fn new(pages: usize) -> LruChangeTracker<N> {
+	let mut change_mask = BitVec::with_capacity(pages);
+	change_mask.grow(pages, false);
+	LruChangeTracker {
+	    change_mask,
+	    change_set: Vec::new(),
+	}
+    }
+
+    /// Add index `i` to change-set.
+    fn add(&mut self, i: usize) {
+	let pg_num = i / Self::ITEMS_PER_PAGE;
+	match self.change_mask.get(pg_num) {
+	    Some(v) if !v => {
+		//trace!("Changed {} page {}", i, pg_num);
+		self.change_mask.set(pg_num, true);
+		self.change_set.push(pg_num);
+	    },
+	    _ => (),
+	}
+    }
+
+    /// Convinience function to add many changes, see: `add`.
+    fn add_many<const S: usize>(&mut self, indexes: &[usize; S]) {
+	for i in indexes {
+	    self.add(*i);
+	}
+    }
+
+    /// Reset changes to 0, returning the current changes in a sorted list.
+    fn reset(&mut self) -> Vec<usize> {
+	self.change_mask.clear();
+	// Anticipate capacity from previous experiences
+	let mut ret = Vec::with_capacity(self.change_set.capacity());
+	std::mem::swap(&mut ret, &mut self.change_set);
+	ret.sort();
+	ret
     }
 }
 
@@ -398,6 +485,8 @@ macro_rules! take_two_refs {
     }
 }
 
+/// Page size used when writing LRU to stable storage.
+pub const LRU_PAGE_SIZE: usize = 4096;
 
 pub(crate) struct LruArray<const N: usize>
 where
@@ -406,8 +495,9 @@ where
 [(); N + 2]: Sized
 {
     size:        usize,
-    items:       PagedVec<LruItem, 4096>,   // TODO: Configurable page size
+    items:       PagedVec<LruItem, LRU_PAGE_SIZE>,   // TODO: Configurable page size
     levels:      [LevelState;N + 2],
+    changes:     LruChangeTracker<N>,
 }
 
 impl<const N: usize> LruArray<N>
@@ -420,11 +510,16 @@ where
     const LEVEL_FREE_ALLOC: Level = Level(1u8);  // Items queued to be free'd
     const LEVEL_USER_START: Level = Level(2u8);  // Start of regular levels
     const LEVELS: usize           = N + 2;
+    const LEVEL_BYTES: usize      = (N + 2) * std::mem::size_of::<LevelState>();
+    const SIZE_BYTES: usize       = std::mem::size_of::<usize>();
+    const META_BYTES: usize       = Self::SIZE_BYTES + Self::LEVEL_BYTES;
+    const ITEMS_PER_PAGE: usize   = LRU_PAGE_SIZE / std::mem::size_of::<LruItem>();
 
     pub fn new(config: &CacheConfig<N>) -> Self {
 	let size = config.blocks;
+	let total = size + Self::LEVELS;
 	// Vec with room for all items + level heads
-	let items = PagedVec::new(size + Self::LEVELS, move |i| {
+	let items = PagedVec::new(total, move |i| {
 	    let (prev, next) = {
 		if i == (size + Self::LEVEL_FREE.0 as usize) {
 		    (size - 1, 0)
@@ -468,11 +563,45 @@ where
 	    }
 	}).collect::<Vec<LevelState>>().try_into().unwrap();
 
+	let pg_count = items.pages();
 	LruArray {
 	    size,
 	    items,
 	    levels,
+	    changes: LruChangeTracker::new(pg_count),
 	}
+    }
+
+    /// Load state from the meta-block and the content pages through the loader.
+    pub fn from_loader<F, E>(meta: &[u8], loader: F) -> Result<Self, E>
+    where
+	F: FnMut(usize, &mut [u8; LRU_PAGE_SIZE]) -> Result<(), E>
+    {
+	assert!(meta.len() == Self::META_BYTES);
+	// Meta layout:
+	// - size                 => SIZE_BYTES
+	// - [LevelState; N + 2]  => LEVEL_BYTES
+	let base_ptr = meta.as_ptr();
+	// Unsafe: Guarded by META_BYTES check
+	let size = unsafe { *(base_ptr as *const usize) };
+	let total = size + Self::LEVELS;
+
+	// Unsafe: LEVEL_BYTES, checked above, is enough to contain the levels
+	let levels = unsafe {
+	    // Unsafe: META_BYTES guarantees ptr add is within slice
+	    let ptr = base_ptr.add(Self::SIZE_BYTES); // u8, so byte offset
+	    std::slice::from_raw_parts(ptr as *const LevelState, Self::LEVELS)
+	};
+	trace!("Loading LRU of size {}", size);
+	let levels: [LevelState; N + 2] = std::array::from_fn(|i| levels[i]);
+	let items = PagedVec::<_, LRU_PAGE_SIZE>::from_loader(total, loader)?;
+	let pg_count = items.pages();
+	Ok(LruArray {
+	    size,
+	    items,
+	    levels,
+	    changes: LruChangeTracker::new(pg_count),
+	})
     }
 
     /// Balance the levels, i.e. move items down a notch if they overflow the level allowance
@@ -526,6 +655,9 @@ where
 		s_head.set_prev(new_prev_ndx.into());
 		// Update heads
 		t_head!().set_next(item_ndx.into());
+		// Record the changes (heads recorded separately)
+		self.changes.add_many(&[item_ndx, first_ndx]);
+
 		// NB: Fixup 'source tail' later on when writing to array, as we only need to do it once
 		// after all items are balanced
 		last_prev_ndx = Some(new_prev_ndx);
@@ -533,6 +665,7 @@ where
 	    // As noted above, the last item remaining on the source level must have its next ptr fixed
 	    let last_ndx = last_prev_ndx.unwrap();
 	    self.items[last_ndx].set_next(s_head_ndx.into());
+	    self.changes.add_many(&[last_ndx, s_head_ndx, t_head_ndx]);
 	    trace!("Balanced {} items on level {}", balanced, ndx);
 	}
 	balanced
@@ -557,31 +690,33 @@ where
 	let free_head_ndx = self.level_head(Self::LEVEL_FREE);
 	let free_head     = self.items[free_head_ndx];
 	let slot          = free_head.prev();                   // <- Our slot
+	let slot_ndx: usize = slot.into();
 	let slot_item     = self.items[usize::from(slot)];
-	let new_last      = slot_item.prev();
+	let new_last_ndx:usize  = slot_item.prev().into();
 
 	// Update "new last" (if allocated == 0, this is the head)
-	self.items[usize::from(new_last)]
+	self.items[new_last_ndx]
 	    .set_next(free_head_ndx.into());
 
 	// Update free head
 	self.items[free_head_ndx]
-	    .set_prev(new_last);
+	    .set_prev(new_last_ndx.into());
 
 	// Update user level head
 	let level_head_ndx = self.level_head(user_level);
 	let level_head = self.items[level_head_ndx];
-	let next_slot = level_head.next();
-	self.items[usize::from(next_slot)]
+	let next_slot_ndx: usize = level_head.next().into();
+	self.items[next_slot_ndx]
 	    .set_prev(slot);
-	self.items[level_head_ndx]
-	    .set_next(slot);
-	let slot_item = &mut self.items[usize::from(slot)];
-	slot_item.set_next(next_slot);
+	let  [slot_item, level_head] = self.items.take_refs_mut([slot_ndx, level_head_ndx]);
+	level_head.set_next(slot);
+	slot_item.set_next(next_slot_ndx.into());
 	slot_item.set_prev(level_head_ndx.into());
 	slot_item.set_level(user_level.try_into().unwrap()); // Compile time constraint makes this always work!
 	// And update book-keeping
 	self.levels[usize::from(user_level)].allocated += 1;
+	// And what indexes were touched
+	self.changes.add_many(&[free_head_ndx, level_head_ndx, slot_ndx, new_last_ndx, next_slot_ndx]);
 	Some(slot)
     }
 
@@ -632,11 +767,84 @@ where
 	name_index!(next, self.items, next_ndx);
 	prev!().set_next(next_ndx.into());
 	next!().set_prev(prev_ndx.into());
+	self.changes.add_many(&[item_ndx, prev_ndx, next_ndx, t_head_ndx, old_top_ndx]);
     }
 
-    /// Iterator from high->low
+    fn get_level_bytes<'a>(&'a self) -> &'a [u8] {
+	let level_ptr  = &self.levels as *const LevelState;
+	let level_ptr  = level_ptr as *const u8;
+	// Unsafe: Construct u8 slice from levels - The array byte length is in LEVEL_BYTES,
+	//         and the pointer from above is obviously correct :)
+	let slice = unsafe {
+	    std::slice::from_raw_parts(level_ptr, Self::LEVEL_BYTES)
+	};
+	slice
+    }
+
+    // Get a boxed slice with the meta bytes
+    fn get_meta(&self) -> Box<[u8]> {
+	// A bit inefficient allocation, but compiler might some day be intelligent
+	// enough to optimize this out? :)
+	let meta_bytes: Vec<u8> = vec![0; Self::META_BYTES];
+	let mut meta_bytes = meta_bytes.into_boxed_slice();
+	let level_bytes = self.get_level_bytes();
+	let level_ptr = level_bytes.as_ptr();
+	let meta_ptr = (*meta_bytes).as_mut_ptr();
+	// Unsafe: copying META_BYTES
+	unsafe {
+	    // Copy SIZE_BYTES
+	    std::ptr::copy_nonoverlapping(&self.size as *const usize,
+					  meta_ptr as *mut usize,
+					  1);
+	    // Copy LEVEL_BYTES
+	    std::ptr::copy_nonoverlapping(level_ptr,
+					  meta_ptr.add(Self::SIZE_BYTES),
+					  Self::LEVEL_BYTES);
+	    // => META_BYTES copied
+	}
+	meta_bytes
+    }
+
+    /// Save the whole lru; This also counts as a checkpoint..
+    pub fn save<'a>(&'a mut self) -> (Box<[u8]>, LruPageIterator<'a, N>) {
+	let pvec_iter = self.items.page_iter();
+	let iter = LruPageIterator::new(pvec_iter);
+	let meta = self.get_meta();
+	self.changes.reset();
+	(meta, iter)
+    }
+
+    /// Return the changed pages since last checkpoint; If `full_checkpoint` is
+    /// set, all pages are returned. Initialization isn't counted as a "change"
+    /// (for obvious reasons), so before checkpointing you should save the whole
+    /// lru with `save()`.
+    ///  This returns the current immutable state that can be written to disk.
+    /// TODO: Currently not endian-safe, i.e. saved state can't be read on a computer
+    ///       with a differing endian-cpu; e.g. x86 <-> SPARC
+    pub fn checkpoint(&mut self) -> (Box<[u8]>, ShadowPages<LRU_PAGE_SIZE>) {
+	//let level_states;
+	let changes = self.changes.reset();
+	trace!("{} changes", changes.len());
+	// FIXME: API thinko: we are indexing with page granularity, but shadow
+	// takes the changes as index grandularity,
+	// for now, just translate to per page indexes until fixex with
+	// a better API.
+	let changes: Vec<usize> = changes.iter().map(|page| page * Self::ITEMS_PER_PAGE).collect();
+	let shadow = self.items.take_shadow_pages(changes.as_slice());
+	let meta = self.get_meta();
+	(meta, shadow)
+    }
+
+    /// Inspect LruItem at specific index, only for testing and validation
     #[cfg(test)]
-    pub fn iter<'a>(&'a self) -> LruIterator<'a, N> {
+    pub(crate) fn inspect(&self, item: usize) -> Option<&LruItem> {
+	self.items.get(item)
+    }
+
+    /// Iterator over all LruItems, including the heads
+    /// For testing purposes; validating content.
+    #[cfg(test)]
+    pub(crate) fn iter<'a>(&'a self) -> LruIterator<'a, N> {
 	LruIterator::new(self)
     }
 
@@ -656,23 +864,56 @@ where
     {
 	(0..n).map(|_| self.get(L).unwrap()).collect()
     }
+}
 
+impl<const N: usize> PartialEq for LruArray<N>
+where
+    [(); 14 - N]: Sized, // 4 bits for levels -> 16 - 2 = 14 levels
+    [(); N + 3]: Sized,  // This guards that we have at least one user level
+[(); N + 2]: Sized
+{
+    fn eq(&self, other: &Self) -> bool {
+	let size = self.size == other.size;
+	let levels = self.levels.iter().zip(other.levels.iter()).all(|(a, b)| a == b);
+	let items = self.items.iter().zip(other.items.iter()).all(|(a,b)| a == b);
+	if !size {
+	    trace!("Size differs");
+	}
+	if !levels {
+	    trace!("Levels differ");
+	}
+	if !items {
+	    trace!("Items differ");
+	}
+	size && levels && items
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::fs::File;
+    use std::io::{Read, Write, Seek, SeekFrom};
+
     use log::{ trace };
     use test_log::test;
 
     use super::{LruArray, Slot};
     use crate::config::CacheConfig;
+    use crate::test::TestPath;
+
     // TODO: Macro for generating tests for different configurations
     const L1: usize = 0;
     const L2: usize = 1;
     const L3: usize = 2;
     const L4: usize = 3;
     const LEVELS: usize = 3;
+    // LRU item count, fill 10 pages to test out paging (the 11:th will have the heads)
+    const PAGES: usize = 10;
+    const TOTAL_PAGES: usize = PAGES + 1;
+    const SIZE: usize = PAGES * super::LRU_PAGE_SIZE / 8;
+    const TOTAL_SIZE: usize = SIZE + LruArray::<LEVELS>::LEVELS;
+    const ITEMS_PER_PAGE: usize = super::LRU_PAGE_SIZE / 8;
 
     // Compare
     fn compare_level<'a, A, B, C, ITER>(checklist: A, mut level_iterator: B) -> bool
@@ -703,9 +944,40 @@ mod tests {
 	}
     }
 
+    /// Save lru checkpoint data to file
+    fn save_checkpoint(file: &mut File, lru: &mut LruArray<LEVELS>) -> Box<[u8]>{
+	let (meta, pages) = lru.checkpoint();
+	trace!("Pages to write: {}", pages.as_slice().len());
+	for (pg_num, data) in pages.as_slice().iter() {
+	    trace!("Writing page {}: {} - {}", pg_num, pg_num * ITEMS_PER_PAGE, (pg_num + 1) * ITEMS_PER_PAGE - 1);
+	    file.seek(SeekFrom::Start(u64::try_from(pg_num * super::LRU_PAGE_SIZE).unwrap())).unwrap();
+	    file.write(*data).unwrap();
+	}
+	meta
+    }
+
+    /// Construct lru from meta and saved pages on disk
+    fn lru_from_loader(meta: &[u8], save_file: &mut File) -> LruArray<LEVELS> {
+	save_file.seek(SeekFrom::Start(0)).unwrap();
+	// Expect that the pages are loaded in order
+	let mut expect_ndx: usize = 0;
+
+	LruArray::<LEVELS>::from_loader(&meta, |ndx, buf: &mut [u8; super::LRU_PAGE_SIZE]| {
+	    assert!(ndx == expect_ndx, "Not loading pages in order!?");
+	    expect_ndx += 1;
+	    // No need to seek; going in order
+	    save_file.read(buf).and_then(|bytes| {
+		assert!(bytes == super::LRU_PAGE_SIZE);
+		Ok(())
+	    })
+	}).unwrap()
+    }
+
     #[test]
     fn test_lru() {
-	let config = CacheConfig::<LEVELS>::default(1000);
+	let tmp_path = TestPath::new("lru_test_lru").unwrap();
+
+	let config = CacheConfig::<LEVELS>::default(SIZE);
 	let mut lru = LruArray::new(&config);
 	let mut l1_slots = lru.get_slots::<L1, VecDeque<Slot>>(10);
 	let mut l2_slots = lru.get_slots::<L2, VecDeque<Slot>>(10);
@@ -720,6 +992,7 @@ mod tests {
 	assert!(compare_level(&l1_slots, lru.level_iter::<L1>()));
 	assert!(compare_level(&l2_slots, lru.level_iter::<L2>()));
 	assert!(compare_level(&l3_slots, lru.level_iter::<L3>()));
+
 
 	// Now fill up all levels (to test availability and, later, the balancer
 	let r1 = (config.level_pct[L1] as f64 / 100.0 * config.blocks as f64).floor() as usize - 10;
@@ -737,6 +1010,54 @@ mod tests {
 	assert!(compare_level(&l1_slots, lru.level_iter::<L1>()));
 	assert!(compare_level(&l2_slots, lru.level_iter::<L2>()));
 	assert!(compare_level(&l3_slots, lru.level_iter::<L3>()));
+
+
+	// Try saving and restoring contents
+
+	let checkpoint = lru.save();
+	let save_file_name = tmp_path.as_ref().join("saved_lru");
+	let mut save_file = File::options()
+	    .create_new(true)
+	    .read(true)
+	    .write(true)
+	    .open(save_file_name).unwrap();
+
+	// Write pages and levels to file
+	for page in checkpoint.1 {
+	    save_file.write_all(page).unwrap();
+	}
+	// Lazy, stuff meta in array
+	let meta = checkpoint.0;
+
+	let lru2 = lru_from_loader(&meta, &mut save_file);
+
+	assert!(compare_level(&l1_slots, lru2.level_iter::<L1>()));
+	assert!(compare_level(&l2_slots, lru2.level_iter::<L2>()));
+	assert!(compare_level(&l3_slots, lru2.level_iter::<L3>()));
+	assert!(lru == lru2);
+	drop(lru2);
+	// Checkpoint lru and re-load from checkpoint and validate
+	macro_rules! test_checkpoint {
+	    () => {
+		let meta = save_checkpoint(&mut save_file, &mut lru);
+		let lru2 = lru_from_loader(&meta, &mut save_file);
+		if lru != lru2 {
+		    for (ndx, (item1, item2)) in lru.iter().zip(lru2.iter()).enumerate() {
+			if item1 != item2 {
+			    trace!("Items differ at {}", ndx);
+			    assert!(false);
+			}
+		    }
+		}
+	    }
+	}
+	test_checkpoint!();
+
+	// ^ /save
+	// Now we need to see that checkpointing saves everything
+	// Still using the same file for checkpoints so that we can restore from the loader
+
+
 	// It should still be in great balance
 	let balanced = lru.balance();
 	assert!(balanced == 0);
@@ -745,6 +1066,8 @@ mod tests {
 	assert!(compare_level(&l3_slots, lru.level_iter::<L3>()));
 	// Balance should put one item to the cleaner
 	assert!(lru.balance() == 1);
+
+	test_checkpoint!();
 
 	// And now should be in balance again
 	assert!(lru.balance() == 0);
@@ -757,6 +1080,8 @@ mod tests {
 	assert!(compare_level(&l2_slots, lru.level_iter::<L2>()));
 	assert!(compare_level(&l3_slots, lru.level_iter::<L3>()));
 
+	test_checkpoint!();
+
 	// Promote the previously "downgraded" items;
 	let l2_promote = l1_slots.pop_back().unwrap();
 	let l3_promote = l2_slots.pop_back().unwrap();
@@ -768,8 +1093,12 @@ mod tests {
 	assert!(compare_level(&l2_slots, lru.level_iter::<L2>()));
 	assert!(compare_level(&l3_slots, lru.level_iter::<L3>()));
 
+	test_checkpoint!();
+
 	// Promote again; This must also be checked for!
 	lru.promote(l2_promote, Some(1));
 	assert!(compare_level(&l2_slots, lru.level_iter::<L2>()));
+
+	test_checkpoint!();
     }
 }
