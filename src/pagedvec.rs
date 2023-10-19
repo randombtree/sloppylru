@@ -473,6 +473,12 @@ where
 	refs.map(|(_ndx, mutref)| mutref)
     }
 
+    /// Get iterator over the values in this container
+    pub fn iter<'a>(&'a self) -> Iter<'a, T, N>
+    {
+	Iter::new(&self)
+    }
+
     /// Get a page iterator for write-output purposes.
     pub fn page_iter<'a>(&'a self) -> PageIter<'a, T, N> {
 	let shadow = Box::new(self.shadow.clone());
@@ -523,6 +529,44 @@ impl<T, const N: usize> IndexMut<usize> for PagedVec<T, N>
 {
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
 	self.get_mut(index).expect("PagedVec: Index out of bounds")
+    }
+}
+
+
+/// PagedVec iterator over items in container
+pub struct Iter<'a, T, const N: usize>
+where
+    T: Sized  + Clone + 'static,
+[T; N]: Sized,
+{
+    index: usize,
+    pagedvec: &'a PagedVec<T, N>,
+}
+
+impl<'a, T, const N: usize> Iter<'a, T, N>
+    where
+    T: Sized  + Clone + 'static,
+[T; N]: Sized,
+{
+    fn new(pagedvec: &'a PagedVec<T, N>) -> Iter<'a, T, N> {
+	Iter {
+	    index: 0,
+	    pagedvec,
+	}
+    }
+}
+
+impl<'a, T, const N: usize> Iterator for Iter<'a, T, N>
+    where
+    T: Sized  + Clone + 'static,
+[T; N]: Sized,
+{
+    type Item = &'a T;
+    fn next(&mut self) -> Option<Self::Item> {
+	self.pagedvec.get(self.index).and_then(|i| {
+	    self.index += 1;
+	    Some(i)
+	})
     }
 }
 
@@ -750,6 +794,17 @@ mod tests {
 	assert!(vec[0].foo == 0);
 	assert!(vec[1].foo == 1000);
 	assert!(vec[2].foo == 2000);
+    }
+
+    #[test]
+    fn test_iter() {
+	let vec = create_pvec();
+	let mut counter: usize = 0;
+	for (index, item) in vec.iter().enumerate() {
+	    assert!(index == item.foo);
+	    counter += 1;
+	}
+	assert!(counter == CAPACITY, "Iterator did not return all items?");
     }
 
     #[test]
