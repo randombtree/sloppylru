@@ -474,7 +474,7 @@ where
     }
 
     /// Get a page iterator for write-output purposes.
-    pub fn page_iter<'a>(&'a self) -> PageIter<'a, &'a PagedVec<T, N>, N> {
+    pub fn page_iter<'a>(&'a self) -> PageIter<'a, T, N> {
 	let shadow = Box::new(self.shadow.clone());
 	PageIter::new(shadow)
     }
@@ -527,13 +527,21 @@ impl<T, const N: usize> IndexMut<usize> for PagedVec<T, N>
 }
 
 
-pub struct PageIter<'a, T, const N: usize> {
+pub struct PageIter<'a, T, const N: usize>
+where
+    T: Sized  + Clone + 'static,
+[T; N]: Sized,
+{
     getter: Box<dyn PageGetter<N>>,
     page_index: usize,
-    phantom: std::marker::PhantomData<&'a T>,
+    phantom: std::marker::PhantomData<&'a PagedVec<T, N> >,
 }
 
-impl<'a, T, const N: usize> PageIter<'a, T, N> {
+impl<'a, T, const N: usize> PageIter<'a, T, N>
+    where
+    T: Sized  + Clone + 'static,
+[T; N]: Sized,
+{
     fn new(getter: Box<dyn PageGetter<N>>) -> PageIter<'a, T, N> {
 	PageIter {
 	    getter,
@@ -543,7 +551,11 @@ impl<'a, T, const N: usize> PageIter<'a, T, N> {
     }
 }
 
-impl<'a, T, const N: usize> Iterator for PageIter<'a, T, N> {
+impl<'a, T, const N: usize> Iterator for PageIter<'a, T, N>
+    where
+    T: Sized  + Clone + 'static,
+[T; N]: Sized,
+{
     type Item = &'a [u8; N];
     fn next(&mut self) -> Option<Self::Item> {
 	if let Some(ptr) = self.getter.get_page(self.page_index) {
