@@ -91,12 +91,19 @@ mod tests {
 	    let db_path = TestPath::new("test_create_lru").unwrap();
 	    assert!(db_path.as_ref().is_dir());
 	    let manager = CacheManager::<2, 64>::open(db_path.as_ref()).unwrap();
-	    let cache = manager.new_cache("my_cache",
-					  CacheConfig::default(1000)).unwrap();
+	    macro_rules! open_cache {
+		() => { manager.new_cache("my_cache", CacheConfig::default(20 * lru::LRU_PAGE_SIZE)).unwrap() }
+	    }
+	    let cache = open_cache!();
 	    let key = gen_key();
 
 	    let slot = insert_key(&cache, &key, 1);
 	    let slot2 = cache.get(&key, Some(1)).unwrap();
+	    assert!(slot == slot2);
+	    drop(cache);
+	    // Test re-loading
+	    let cache = open_cache!();
+	    let slot2 = cache.get(&key, None).unwrap();
 	    assert!(slot == slot2);
 	}
     }
