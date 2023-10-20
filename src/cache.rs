@@ -1,7 +1,5 @@
 /// SloppyLRU cache
 /// @todo Use plain file + log for rmap transaction for faster insert speed
-
-use std::fs;
 use std::str;
 use std::sync::{Arc, RwLock, Weak};
 use futures::channel::{mpsc, oneshot};
@@ -20,10 +18,13 @@ use sled::transaction::{
     ConflictableTransactionError
 };
 
-use crate::result::Result;
+use crate::result::{
+    Error,
+    Result,
+};
 use crate::config::CacheConfig;
 use crate::manager::CacheManager;
-use crate::lru::{LruArray, Slot};
+use crate::lru::{LruArray, Slot, LRU_PAGE_SIZE};
 use crate::key::Key;
 
 type Inner<const N: usize, const K: usize> = CacheInner<N, K>;
@@ -80,20 +81,52 @@ where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized {
     pub fn new(manager: &CacheManager<N,K>, name: &str, config: CacheConfig<N>) -> Result<Cache<N, K>> {
 	let manager = manager.clone();
 	debug!("New cache: {}, size: {} blocks", name, config.blocks);
-	// TODO: using a db for a continious space is really unneccesary and inefficient, but
-	//       this way we get transactions for free for the moment
-	let path = manager.path();
-	assert!(path.is_dir());
-	let path = path.join(name);
-	if !path.is_dir() {
-	    trace!("Create directory for cache: {:?}", path);
-	    fs::create_dir(&path)?;
-	}
+	// Store everything in the DB, we get transactions "for free".
 	let rmap_name = format!("{}!!rmap", name);
+	let lru_name  = format!("{}!!lru", name);
 	let tree = manager.db().open_tree(name)?;
 	let rtree = manager.db().open_tree(rmap_name)?;
+	let lru_tree = manager.db().open_tree(lru_name)?;
 	let name = String::from(name);
-	let lru = LruArray::new(&config);
+	let lru = {
+	    if let Ok(Some(iv_meta)) = lru_tree.get(LRU_META_KEY) {
+		trace!("Loading LRU from disk");
+		// Opening existing LRU
+		LruArray::<N>::from_loader(iv_meta.as_ref(), |num, buf: &mut [u8; LRU_PAGE_SIZE]| {
+		    // TODO: Recovery from corrupt database, iv_meta should be there only
+		    //       after a successful transaction
+		    let iv = lru_tree.get(LruBlockKey::from(num))?
+			.ok_or_else(
+			    || Error::CorruptError(format!("Block {} is missing from LRU. Database corrupt!", num)))?;
+		    let src: &[u8] = iv.as_ref();
+		    if src.len() != buf.len() {
+			return Err(Error::CorruptError(format!("Block {} is truncated to {} bytes. Database corrupt!",
+							       num, src.len())));
+		    }
+		    buf.as_mut_slice().copy_from_slice(iv.as_ref());
+		    // Mixing some error types, make sure it's "our" own error collection type.
+		    Ok::<(), Error>(())
+		})?
+	    } else {
+		// New LRU: create LRU and save to disk
+		// Run in transaction to make sure the LRU data stays consistent
+		trace!("Creating new LRU");
+		lru_tree.transaction(|tx| {
+		    let mut lru = LruArray::new(&config);
+		    // Save initial lru setup in DB
+		    let (lru_meta, lru_iter) = lru.save();
+		    for (num, page) in lru_iter.enumerate() {
+			tx.insert(LruBlockKey::from(num).as_ref(), page.as_slice())?;
+		    }
+		    tx.insert(LRU_META_KEY.as_ref(), lru_meta)?;
+		    Ok(lru)
+		}).map_err(|e| match e {
+		    // The abort could be some other type; we are however not using abort().
+		    sled::transaction::TransactionError::Abort(db_err) => Error::DbError(db_err),
+		    sled::transaction::TransactionError::Storage(db_err) => Error::DbError(db_err),
+		})?
+	    }
+	};
 	// The free hystesis point is about when there will be arriving new free ops
 	let hysteresis_blocks: usize =
 	    ((100.0 - config.free_hysteresis_pct as f64) / 100.0 * config.free_slack as f64).floor() as usize;
@@ -101,10 +134,10 @@ where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized {
 	let flusher_receiver = Some(flusher_receiver);
 	Ok(Cache(Arc::new(CacheInner {
 	    name,
-	    config,
 	    manager,
 	    tree,
 	    rtree,
+	    lru_tree,
 	    flusher_sender,
 	    rw: RwLock::new(CacheConcurrent {
 		lru,
@@ -156,11 +189,17 @@ where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized {
 	    // TODO: LRU slot transaction
 	    let mut rw = inner.rw.write().unwrap();
 	    if let Some(slot) = rw.lru.get(level) {
+		// Get the lru changes up to now.
+		let (lru_meta, lru_shadow) = rw.lru.checkpoint();
 		let res =
-		    (&inner.tree, &inner.rtree)
-		    .transaction(|(tx_tree, tx_rtree)| {
+		    (&inner.tree, &inner.rtree, &inner.lru_tree)
+		    .transaction(|(tx_tree, tx_rtree, tx_lru)| {
 			tx_tree.insert(key.as_ref(), sled::IVec::from(slot))?;
 			tx_rtree.insert(&slot.as_key(), key.as_ref())?;
+			for (pg_num, data) in lru_shadow.as_slice().iter() {
+			    tx_lru.insert(LruBlockKey::from(*pg_num).as_ref(), data.as_slice())?;
+			}
+			tx_lru.insert(LRU_META_KEY.as_ref(), &*lru_meta)?;
 			if false {
 			    abort(())?;
 			}
@@ -198,12 +237,13 @@ struct CacheInner<const N: usize, const K: usize>
 where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized
 {
     name: String,
-    config: CacheConfig<N>,
     manager: CacheManager<N,K>,
     /// Sled sub-keyspace for mapping key -> slot
     tree: sled::Tree,
     /// Sled sub-keyspace for mapping slot -> key
     rtree: sled::Tree,
+    /// Sled sub-keyspace for lru block storage
+    lru_tree: sled::Tree,
     /// Wakeup signal to flusher task
     flusher_sender: mpsc::Sender<FlusherMsg>,
     rw: RwLock<CacheConcurrent<N>>,
@@ -230,3 +270,32 @@ where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized
     flusher_receiver: Option<mpsc::Receiver<FlusherMsg>>,
 }
 
+
+/// LRU Block key helper. Allows us to access the underlying bits.
+/// LRU block keys are signed as we use -1 as the meta key.
+struct LruBlockKey(i32);
+
+impl From<i32> for LruBlockKey {
+    fn from(v: i32) -> LruBlockKey {
+	assert!(v >= -1);
+	LruBlockKey(v)
+    }
+}
+
+impl From<usize> for LruBlockKey {
+    fn from(v: usize) -> LruBlockKey {
+	LruBlockKey(i32::try_from(v).unwrap())
+    }
+}
+
+impl AsRef<[u8]> for LruBlockKey {
+    fn as_ref(&self) -> &[u8] {
+	let ptr = (&self.0) as *const i32 as *const u8;
+	// Unsafe: Creating fat ptr to [u8] slice over the memory of an i32 (4 bytes).
+	unsafe {
+	    std::slice::from_raw_parts(ptr, std::mem::size_of::<i32>())
+	}
+    }
+}
+
+const LRU_META_KEY: LruBlockKey = LruBlockKey(-1);
