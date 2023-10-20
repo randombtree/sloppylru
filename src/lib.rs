@@ -59,7 +59,7 @@ mod tests {
     fn initialize() {
         INIT.call_once(|| {
             // Simple stdout logger, use RUST_LOG to set debug output (e.g. RUST_LOG=sloppylru=trace)
-	    // let _ = env_logger::builder().is_test(true).init();
+	    let _ = env_logger::builder().is_test(true).try_init();
 	    // NB: Only visible when test fails
         });
     }
