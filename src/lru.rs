@@ -318,6 +318,7 @@ impl<'a, const N: usize> Iterator for LevelIterator<'a, N>
 }
 
 
+#[cfg(test)]
 pub(crate) struct LruIterator<'a, const N: usize>
     where
     [(); 14 - N]: Sized, // 4 bits for levels -> 16 - 2 = 14 levels
@@ -328,7 +329,7 @@ pub(crate) struct LruIterator<'a, const N: usize>
     lru: &'a LruArray<N>,
 }
 
-
+#[cfg(test)]
 impl<'a, const N: usize> LruIterator<'a, N>
     where
     [(); 14 - N]: Sized, // 4 bits for levels -> 16 - 2 = 14 levels
@@ -343,7 +344,7 @@ impl<'a, const N: usize> LruIterator<'a, N>
     }
 }
 
-
+#[cfg(test)]
 impl<'a, const N: usize> Iterator for LruIterator<'a, N>
         where
     [(); 14 - N]: Sized, // 4 bits for levels -> 16 - 2 = 14 levels
