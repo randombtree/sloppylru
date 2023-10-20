@@ -649,6 +649,7 @@ impl<const N: usize> Drop for ShadowPages<N>
 }
 
 
+#[cfg(test)]
 mod tests {
     use log::trace;
     use super::PagedVec;
