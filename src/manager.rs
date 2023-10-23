@@ -116,6 +116,8 @@ where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use futures::future::Future;
+    use futures::join;
     use rand;
     use smol;
     use test_log::test;
@@ -148,8 +150,11 @@ mod tests {
 	CacheConfig::default(pages * lru::LRU_PAGE_SIZE)
     }
 
-    fn open_cache(manager: &MyManager, name: &str) -> MyCache {
-	manager.new_cache(name, get_config(CACHE_SIZE_PAGES)).unwrap()
+    async fn open_cache(manager: &MyManager, name: &str) -> (MyCache, impl Future<Output = ()>) {
+	let cache = manager.new_cache(name, get_config(CACHE_SIZE_PAGES)).unwrap();
+	let flusher = cache.run().await;
+	let task = smol::spawn(async move { flusher.await });
+	(cache, task)
     }
 
     #[test]
@@ -158,10 +163,12 @@ mod tests {
 	    let db_path = TestPath::new("test_manager").unwrap();
 	    let manager = open_manager(db_path).unwrap();
 	    macro_rules! open_cache {
-		() => { open_cache(&manager, "my_cache")}
+		() => {
+		    open_cache(&manager, "my_cache").await
+		}
 	    }
-	    let cache = open_cache!();
-	    let cache2 = open_cache(&manager, "other_cache");
+	    let (cache, flusher) = open_cache!();
+	    let (cache2, flusher2) = open_cache(&manager, "other_cache").await;
 	    let key = gen_key();
 	    let key2 = gen_key();
 	    let slot = cache.insert(&key, 1).await;
@@ -169,13 +176,14 @@ mod tests {
 	    // The insertion method is deterministic at the moment, so both slots should be the "same".
 	    assert!(slot == slot2);
 	    macro_rules! verify_key {
-		($cache: ident, $key:ident, $slot:expr) => {
-		    let slot2 = $cache.get(&$key, None).unwrap();
-		    assert!($slot == slot2);
+		($cache: ident, $key:ident, $slot:expr $(, $opt:expr)*) => {
+		    let slot2 = $cache.get(&$key, None);
+		    assert!(slot2.is_some(), $($opt),*);
+		    assert!($slot == slot2.unwrap(), $($opt),*);
 		}
 	    }
 	    // Inserted, should be found
-	    verify_key!(cache, key, slot);
+	    verify_key!(cache, key, slot, "Key not found in cache after insert?");
 	    verify_key!(cache2, key2, slot2);
 	    // But neither should be found in it's sibling cache
 	    assert!(cache.get(&key2, None).is_none());
@@ -183,8 +191,13 @@ mod tests {
 
 	    // Test re-loading
 	    drop(cache);
-	    let cache = open_cache!();
-	    verify_key!(cache, key, slot);  // Key should still be there
+	    flusher.await;
+	    let (cache, flusher) = open_cache!();
+	    verify_key!(cache, key, slot, "Key not found after reload?");
+
+	    drop(cache);
+	    drop(cache2);
+	    join!(flusher, flusher2);
 	});
     }
 }

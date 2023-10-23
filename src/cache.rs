@@ -9,6 +9,7 @@ use log::{
     debug,
     error,
     trace,
+    warn,
 };
 
 use sled;
@@ -27,9 +28,12 @@ use crate::lru::{LruArray, Slot, LRU_PAGE_SIZE};
 use crate::key::Key;
 
 type Inner<const N: usize, const K: usize> = CacheInner<N, K>;
+
+
 /// A LRU cache with N levels
 pub struct Cache<const N: usize, const K: usize>(Arc<Inner<N, K>>)
 where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized;
+
 
 /// Weak cache reference for manager to use, with the matching TryInto:s
 pub(crate) struct WeakCache<const N: usize, const K: usize>(Weak<Inner<N, K>>)
@@ -137,27 +141,28 @@ where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized {
 	    tree,
 	    rtree,
 	    lru_tree,
-	    flusher_sender,
 	    rw: RwLock::new(CacheConcurrent {
 		lru,
+		flusher_sender,
 		flusher_receiver,
 	    }),
 	})))
     }
 
     /// Returns flusher function closure that must be run
+    /// Returns a future that sheds the references to the cache.
     pub async fn run(&self) -> impl Future<Output = ()> {
-	let this = self.0.clone();
-	let mut receiver = Option::None;
-	{
-	    let mut rw = this.rw.write().unwrap();
-	    debug!("Starting flusher for cache '{}'", this.name);
-	    std::mem::swap(&mut rw.flusher_receiver, &mut receiver);
-	}
-	// Crash if run multiple times
-	let mut receiver = receiver.unwrap();
+	let mut receiver =  {
+	    let mut rw = self.0.rw.write().unwrap();
+	    debug!("Starting flusher for cache '{}'", self.0.name);
+	    // Crash if run multiple times
+	    rw.flusher_receiver.take().unwrap()
+	};
+
+	let weak_this = Arc::downgrade(&self.0);
 
 	let func = async move {
+	    trace!("Flusher running...");
 	    while let Some(msg) = receiver.next().await {
 		use FlusherMsg::*;
 		match msg {
@@ -166,12 +171,15 @@ where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized {
 		    SHUTDOWN => break,
 		}
 	    }
-	    // Give it back
-	    let mut receiver = Option::Some(receiver);
-	    {
+	    debug!("Stopping flusher for cache");
+
+	    // Generally the shutdown should only happen on drop,
+	    // so this should not be run anyway; but just to be future-proof..
+	    if let Some(this) = weak_this.upgrade() {
+		warn!("Shutting down flusher while cache '{}' still active..", this.name);
 		let mut rw = this.rw.write().unwrap();
-		debug!("Stopping flusher for cache '{}'", this.name);
-		std::mem::swap(&mut rw.flusher_receiver, &mut receiver);
+		// Give it back
+		rw.flusher_receiver = Some(receiver);
 	    }
 	};
 	func
@@ -243,8 +251,6 @@ where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized
     rtree: sled::Tree,
     /// Sled sub-keyspace for lru block storage
     lru_tree: sled::Tree,
-    /// Wakeup signal to flusher task
-    flusher_sender: mpsc::Sender<FlusherMsg>,
     rw: RwLock<CacheConcurrent<N>>,
 }
 
@@ -255,7 +261,8 @@ where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized
 	debug!("Cache {} shutting down", self.name);
 	self.manager.purge_cache_cb(&self.name);
 	// Shut down flusher
-	if let Err(_) = self.flusher_sender.try_send(FlusherMsg::SHUTDOWN) {
+	let mut rw = self.rw.write().unwrap();
+	if let Err(_) = rw.flusher_sender.try_send(FlusherMsg::SHUTDOWN) {
 	    error!("Cache ({}) couldn't shutdown flusher", self.name);
 	}
     }
@@ -265,6 +272,8 @@ struct CacheConcurrent <const N: usize>
 where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized
 {
     lru: LruArray<N>,
+    /// Wakeup signal to flusher task
+    flusher_sender: mpsc::Sender<FlusherMsg>,
     /// Flusher task
     flusher_receiver: Option<mpsc::Receiver<FlusherMsg>>,
 }
