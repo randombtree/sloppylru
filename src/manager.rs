@@ -111,3 +111,80 @@ where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized
     pub(crate) fn db(&self) -> &sled::Db { &self.0.db }
     pub(crate) fn path(&self) -> &std::path::Path { &self.0.path.as_ref() }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use rand;
+    use smol;
+    use test_log::test;
+
+    use crate::cache::Cache;
+    use crate::config::CacheConfig;
+    use crate::key::Key;
+    use crate::lru;
+    use crate::result::Result;
+    use crate::test::TestPath;
+    use super::CacheManager;
+
+
+    const LEVELS: usize    = 2;
+    const KEY_BYTES: usize = 64;
+    const CACHE_SIZE_PAGES: usize = 20;
+    type MyManager = CacheManager<LEVELS, KEY_BYTES>;
+    type MyCache   = Cache<LEVELS, KEY_BYTES>;
+
+    fn open_manager<P: AsRef<Path>>(path: P) -> Result<MyManager> {
+	MyManager::open(path)
+    }
+
+    fn gen_key<const K: usize>() -> Key<K> {
+	let v: Vec<u8> = (0..K).map(|_| rand::random::<u8>()).collect();
+	Key::try_from(v).unwrap()
+    }
+
+    fn get_config(pages: usize) -> CacheConfig<LEVELS> {
+	CacheConfig::default(pages * lru::LRU_PAGE_SIZE)
+    }
+
+    fn open_cache(manager: &MyManager, name: &str) -> MyCache {
+	manager.new_cache(name, get_config(CACHE_SIZE_PAGES)).unwrap()
+    }
+
+    #[test]
+    fn test_manager() {
+	smol::block_on(async {
+	    let db_path = TestPath::new("test_manager").unwrap();
+	    let manager = open_manager(db_path).unwrap();
+	    macro_rules! open_cache {
+		() => { open_cache(&manager, "my_cache")}
+	    }
+	    let cache = open_cache!();
+	    let cache2 = open_cache(&manager, "other_cache");
+	    let key = gen_key();
+	    let key2 = gen_key();
+	    let slot = cache.insert(&key, 1).await;
+	    let slot2 = cache2.insert(&key2, 1).await;
+	    // The insertion method is deterministic at the moment, so both slots should be the "same".
+	    assert!(slot == slot2);
+	    macro_rules! verify_key {
+		($cache: ident, $key:ident, $slot:expr) => {
+		    let slot2 = $cache.get(&$key, None).unwrap();
+		    assert!($slot == slot2);
+		}
+	    }
+	    // Inserted, should be found
+	    verify_key!(cache, key, slot);
+	    verify_key!(cache2, key2, slot2);
+	    // But neither should be found in it's sibling cache
+	    assert!(cache.get(&key2, None).is_none());
+	    assert!(cache2.get(&key, None).is_none());
+
+	    // Test re-loading
+	    drop(cache);
+	    let cache = open_cache!();
+	    verify_key!(cache, key, slot);  // Key should still be there
+	});
+    }
+}
