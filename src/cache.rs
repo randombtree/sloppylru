@@ -15,7 +15,6 @@ use sled;
 use sled::Transactional;
 use sled::transaction::{
     abort,
-    ConflictableTransactionError
 };
 
 use crate::result::{
