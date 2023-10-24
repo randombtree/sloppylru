@@ -700,7 +700,7 @@ where
     pub fn get(&mut self, level: usize) -> Option<Slot>
     {
 	assert!(level < N);
-	let &(mut level_free): &LevelState = &self.levels[usize::from(Self::LEVEL_FREE)];
+	let level_free: &mut LevelState = &mut self.levels[usize::from(Self::LEVEL_FREE)];
 	if level_free.allocated == 0 {
 	    return None;
 	}
@@ -1105,6 +1105,16 @@ mod tests {
 	// Promote again; This must also be checked for!
 	lru.promote(l2_promote, Some(1));
 	assert!(compare_level(&l2_slots, lru.level_iter::<L2>()));
+
+	test_checkpoint!();
+
+	// Test GC, first fill it up
+	let mut items = 0;
+	while let Some(slot) = lru.get(L3) {
+	    items += 1;
+	    l3_slots.push_back(slot);
+	}
+	trace!("Filled LRU with {} items", items);
 
 	test_checkpoint!();
     }
