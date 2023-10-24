@@ -450,6 +450,19 @@ impl<const N: usize> LruChangeTracker<N> {
 }
 
 
+/// On disk LRU meta header
+#[derive(Clone, Copy)]
+#[repr(packed)]
+struct LruMetaHeaderBytes<const N: usize>
+where [(); N + 2]: Sized
+{
+    size:            usize,
+    free_slack:      usize,
+    free_hysteresis: usize,
+    levels:          [LevelState; N + 2],
+}
+
+
 /// Create shorthand name for a list item
 macro_rules! name_index {
     ($name:ident, $list: expr, $ndx:ident) => {
@@ -486,6 +499,7 @@ macro_rules! take_two_refs {
     }
 }
 
+
 /// Page size used when writing LRU to stable storage.
 pub const LRU_PAGE_SIZE: usize = 4096;
 
@@ -496,6 +510,8 @@ where
 [(); N + 2]: Sized
 {
     size:        usize,
+    free_slack:  usize,
+    free_hysteresis: usize,
     items:       PagedVec<LruItem, LRU_PAGE_SIZE>,   // TODO: Configurable page size
     levels:      [LevelState;N + 2],
     changes:     LruChangeTracker<N>,
@@ -511,12 +527,14 @@ where
     const LEVEL_FREE_ALLOC: Level = Level(1u8);  // Items queued to be free'd
     const LEVEL_USER_START: Level = Level(2u8);  // Start of regular levels
     const LEVELS: usize           = N + 2;
-    const LEVEL_BYTES: usize      = (N + 2) * std::mem::size_of::<LevelState>();
-    const SIZE_BYTES: usize       = std::mem::size_of::<usize>();
-    const META_BYTES: usize       = Self::SIZE_BYTES + Self::LEVEL_BYTES;
+
+    /// Header size
+    const META_BYTES: usize       = std::mem::size_of::<LruMetaHeaderBytes<N>>();
     const ITEMS_PER_PAGE: usize   = LRU_PAGE_SIZE / std::mem::size_of::<LruItem>();
 
     pub fn new(config: &CacheConfig<N>) -> Self {
+	let free_slack = config.free_slack;
+	let free_hysteresis = ((config.free_hysteresis_pct as f64) / 100.0 * free_slack as f64).floor() as usize;
 	let size = config.blocks;
 	let total = size + Self::LEVELS;
 	// Vec with room for all items + level heads
@@ -567,6 +585,8 @@ where
 	let pg_count = items.pages();
 	LruArray {
 	    size,
+	    free_slack,
+	    free_hysteresis,
 	    items,
 	    levels,
 	    changes: LruChangeTracker::new(pg_count),
@@ -579,26 +599,25 @@ where
 	F: FnMut(usize, &mut [u8; LRU_PAGE_SIZE]) -> Result<(), E>
     {
 	assert!(meta.len() == Self::META_BYTES);
-	// Meta layout:
+	// Meta layout (also see LruMetaHeaderBytes):
 	// - size                 => SIZE_BYTES
+	// - free_slack          \
+	// - free_hysteresis      => SLACK_BYTES
 	// - [LevelState; N + 2]  => LEVEL_BYTES
 	let base_ptr = meta.as_ptr();
 	// Unsafe: Guarded by META_BYTES check
-	let size = unsafe { *(base_ptr as *const usize) };
+	let LruMetaHeaderBytes { size, free_slack, free_hysteresis, levels } = unsafe {
+	    *(base_ptr as *const LruMetaHeaderBytes<N>)
+	};
 	let total = size + Self::LEVELS;
 
-	// Unsafe: LEVEL_BYTES, checked above, is enough to contain the levels
-	let levels = unsafe {
-	    // Unsafe: META_BYTES guarantees ptr add is within slice
-	    let ptr = base_ptr.add(Self::SIZE_BYTES); // u8, so byte offset
-	    std::slice::from_raw_parts(ptr as *const LevelState, Self::LEVELS)
-	};
 	trace!("Loading LRU of size {}", size);
-	let levels: [LevelState; N + 2] = std::array::from_fn(|i| levels[i]);
 	let items = PagedVec::<_, LRU_PAGE_SIZE>::from_loader(total, loader)?;
 	let pg_count = items.pages();
 	Ok(LruArray {
 	    size,
+	    free_slack,
+	    free_hysteresis,
 	    items,
 	    levels,
 	    changes: LruChangeTracker::new(pg_count),
@@ -771,38 +790,21 @@ where
 	self.changes.add_many(&[item_ndx, prev_ndx, next_ndx, t_head_ndx, old_top_ndx]);
     }
 
-    fn get_level_bytes<'a>(&'a self) -> &'a [u8] {
-	let level_ptr  = &self.levels as *const LevelState;
-	let level_ptr  = level_ptr as *const u8;
-	// Unsafe: Construct u8 slice from levels - The array byte length is in LEVEL_BYTES,
-	//         and the pointer from above is obviously correct :)
-	let slice = unsafe {
-	    std::slice::from_raw_parts(level_ptr, Self::LEVEL_BYTES)
-	};
-	slice
-    }
-
     // Get a boxed slice with the meta bytes
     fn get_meta(&self) -> Box<[u8]> {
 	// A bit inefficient allocation, but compiler might some day be intelligent
 	// enough to optimize this out? :)
 	let meta_bytes: Vec<u8> = vec![0; Self::META_BYTES];
 	let mut meta_bytes = meta_bytes.into_boxed_slice();
-	let level_bytes = self.get_level_bytes();
-	let level_ptr = level_bytes.as_ptr();
-	let meta_ptr = (*meta_bytes).as_mut_ptr();
-	// Unsafe: copying META_BYTES
-	unsafe {
-	    // Copy SIZE_BYTES
-	    std::ptr::copy_nonoverlapping(&self.size as *const usize,
-					  meta_ptr as *mut usize,
-					  1);
-	    // Copy LEVEL_BYTES
-	    std::ptr::copy_nonoverlapping(level_ptr,
-					  meta_ptr.add(Self::SIZE_BYTES),
-					  Self::LEVEL_BYTES);
-	    // => META_BYTES copied
-	}
+	// Unsafe: The meta header is always == META_BYTES
+	let meta = unsafe {
+	    &mut *((*meta_bytes).as_mut_ptr() as *mut LruMetaHeaderBytes<N>)
+	};
+	meta.size = self.size;
+	meta.free_slack = self.free_slack;
+	meta.free_hysteresis = self.free_hysteresis;
+	meta.levels = self.levels;
+
 	meta_bytes
     }
 
@@ -875,10 +877,14 @@ where
 {
     fn eq(&self, other: &Self) -> bool {
 	let size = self.size == other.size;
+	let slack = self.free_slack == other.free_slack && self.free_hysteresis == other.free_hysteresis;
 	let levels = self.levels.iter().zip(other.levels.iter()).all(|(a, b)| a == b);
 	let items = self.items.iter().zip(other.items.iter()).all(|(a,b)| a == b);
 	if !size {
 	    trace!("Size differs");
+	}
+	if !slack {
+	    trace!("Slack differs");
 	}
 	if !levels {
 	    trace!("Levels differ");
@@ -886,7 +892,7 @@ where
 	if !items {
 	    trace!("Items differ");
 	}
-	size && levels && items
+	size && slack && levels && items
     }
 }
 
