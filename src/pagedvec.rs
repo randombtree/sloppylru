@@ -8,7 +8,7 @@ use std::mem;
 use std::ops::{Index, IndexMut};
 use std::ptr;
 use std::ptr::NonNull;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::collections::HashMap;
 use std::iter::Iterator;
 
@@ -72,9 +72,23 @@ where
 	Layout::from_size_align(aligned_size, N).unwrap()
     }
 
+    /// Get the "real" unshadowed page.
+    unsafe fn get_real_page(&self, pgnum: usize) -> *mut T {
+	self.ptr.as_ptr().add(pgnum * Self::ITEMS_PER_PAGE)
+    }
+
+    /// Get the shadow (current) page if it exists
+    fn get_shadow_ptr(&self, pgnum: usize) -> Option<*const T> {
+	if (self.shadow_active || self.current_present) && self.shadowed_pages[pgnum] {
+	    self.current_map.get(&pgnum)
+		.and_then(|non_null| Some(non_null.as_ptr() as *const T))
+	} else {
+	    None
+	}
+    }
 
     /// Get pointer to current page if page is shadowed.
-    fn get_page_ptr(&mut self, pgnum: usize) -> Option<*mut T> {
+    fn get_shadow_ptr_mut(&mut self, pgnum: usize) -> Option<*mut T> {
 	if (self.shadow_active || self.current_present) && self.shadowed_pages[pgnum] {
 	    let page = {
 		// Page is being shadowed, is there already a current page mapped?
@@ -103,6 +117,39 @@ where
 	} else {
 	    None
 	}
+    }
+
+    /// Common getter prelude, returns page index
+    fn _get(&self, ndx: usize) -> Option<usize> {
+	Some(ndx).filter(|ndx| *ndx < self.capacity)
+	    .and_then(|ndx| Some(ndx / Self::ITEMS_PER_PAGE))
+    }
+
+    /// Get a read-only reference to item
+    fn get(&self, ndx: usize) -> Option<*const T> {
+	self._get(ndx)
+	    .and_then(|pgnum| self.get_shadow_ptr(pgnum)
+		      .or_else(|| {
+			  // Unsafe: pgnum is derived from index, checked earlier
+			  Some(unsafe { self.get_real_page(pgnum) })
+		      }))
+	    .and_then(|ptr| {
+		// Unsafe: ptr is to beginning of page, won't overflow
+		Some(unsafe { ptr.add(ndx % Self::ITEMS_PER_PAGE) as *const T })
+	    })
+    }
+
+    /// Get mutable reference to item
+    fn get_mut(&mut self, ndx: usize) -> Option<*mut T> {
+	self._get(ndx)
+	    .and_then(|pgnum| self.get_shadow_ptr_mut(pgnum)
+		      .or_else(|| {
+			  // Unsafe: pgnum is derived from index, checked earlier
+			  Some(unsafe { self.get_real_page(pgnum) })}))
+	    .and_then(|ptr| {
+		// Unsafe: ptr is to beginning of page, won't overflow
+		Some(unsafe { ptr.add(ndx % Self::ITEMS_PER_PAGE) as *mut T })
+	    })
     }
 
     /// Consolidate shadow pages with current pages if possible.
@@ -177,6 +224,13 @@ where
 	})))
     }
 
+    fn get_locked_mut<'a>(&'a mut self) -> LockedPagedVec<'a, T, N> {
+	let mut guard = self.0.lock().unwrap();
+	// Unsafe: We are exclusive - no references can be active -> safe to consolidate
+	unsafe { guard.maybe_consolidate(); }
+	LockedPagedVec::new(guard)
+    }
+
     /// Retrieve the current index pointers for the sorted list `indexes`. This might be to the backing
     /// store or a separate page if the page is being shadowed.
     /// If `consolidate` is set, will sync backing store if shadow isn't active anymore. Consolidation
@@ -203,7 +257,7 @@ where
 	    let page = match last_page {
 		Some((last_num, ptr)) if last_num == pgnum => ptr,
 		_ => {
-		    if let Some(ptr) = inner.get_page_ptr(pgnum) {
+		    if let Some(ptr) = inner.get_shadow_ptr_mut(pgnum) {
 			// Was shadowed
 			ptr
 		    } else {
@@ -306,18 +360,79 @@ where
     T: Sized  + Clone + 'static,
 {
     fn get_page(&self, pg_index: usize) -> Option<*const u8> {
-	let mut inner = self.0.lock().unwrap();
+	let inner = self.0.lock().unwrap();
 	let byte_offset = Self::ITEM_COUNT * pg_index;
 	if byte_offset >= inner.capacity {
 	    return None;
 	}
-	let ptr = match inner.get_page_ptr(pg_index) {
+	let ptr = match inner.get_shadow_ptr(pg_index) {
 	    Some(ptr) => ptr,
 	    // Unsafe: Byte offset checked
 	    _ => unsafe { inner.ptr.as_ptr().add(pg_index * Self::ITEM_COUNT) }
 	};
 	// Unsafe: Guaranteed safe due to allocation granularity
 	unsafe { Some(std::mem::transmute(ptr)) }
+    }
+}
+
+
+/// A locked reference to PagedVec
+/// In PagedVec each individual item access has locking overhead, this locks the
+/// data for the lifetime of the object.
+pub struct LockedPagedVec<'a, T, const N: usize>
+where
+    T: Sized  + Clone + 'static,
+[T; N]: Sized,
+{
+    shadow: MutexGuard<'a, ShadowRegisterInner<T,N>>,
+}
+
+impl<'a, T, const N: usize> LockedPagedVec<'a, T, N>
+where
+    T: Sized  + Clone + 'static,
+[T; N]: Sized,
+{
+    const ITEMS_PER_PAGE: usize = ShadowRegisterInner::<T,N>::ITEMS_PER_PAGE;
+    fn new(shadow: MutexGuard<'a, ShadowRegisterInner<T,N>>) -> LockedPagedVec<'a, T, N> {
+	LockedPagedVec { shadow }
+    }
+
+    fn get(&self, ndx: usize) -> Option<&T> {
+	self.shadow.get(ndx)
+	    .and_then(|ptr|
+		      // Unsafe: Get guarantees that the ptr is safe
+		      Some(unsafe { std::mem::transmute::<_, &T>(ptr) }))
+    }
+
+    fn get_mut(&mut self, ndx: usize) -> Option<&mut T> {
+	// Unsafe: We can consolidate as there are no other refs active (got mut ref!)
+	unsafe { self.shadow.maybe_consolidate() }
+	// Re-use regular get, and do some tricks with the reference
+	self.shadow.get_mut(ndx)
+	    .and_then(|ptr|
+		      // Unsafe: Get mut guarantees the ptr is safe
+		      Some(unsafe { std::mem::transmute::<_, &mut T>(ptr) }))
+    }
+}
+
+impl<'a, T, const N: usize> Index<usize> for LockedPagedVec<'a, T, N>
+where
+    T: Sized  + Clone + 'static,
+[T; N]: Sized,
+{
+    type Output = T;
+    fn index(&self, index: usize) -> &Self::Output {
+	self.get(index).expect("PagedVec: Index out of bounds")
+    }
+}
+
+impl<'a, T, const N: usize> IndexMut<usize> for LockedPagedVec<'a, T, N>
+where
+    T: Sized  + Clone + 'static,
+[T; N]: Sized,
+{
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+	self.get_mut(index).expect("PagedVec: Index out of bounds")
     }
 }
 
@@ -434,6 +549,12 @@ where
 	};
 	// Unsafe: get_current_ptrs always returns correct ptrs or panics.
 	Some(unsafe { &mut *ptr })
+    }
+
+    /// Get locked fast access to items in PagedVec.
+    /// PagedVec will remain locked for the lifetime of the LockedPagedVec.
+    pub fn get_locked_mut<'a>(&'a mut self) -> LockedPagedVec<'a, T, N> {
+	self.shadow.get_locked_mut()
     }
 
     /// Take multiple mutable references to array.
@@ -857,5 +978,38 @@ mod tests {
 
 	assert!(loader.is_err());
 	assert!(loader.err().unwrap() == msg);
+    }
+
+    #[test]
+    fn test_locked() {
+	let mut vec = create_pvec();
+	let len = vec.len();
+	// Take out a few shadow pages to test that code-path
+	let shadows = vec.take_shadow_pages(&[1,2,3]);
+	let mut locked = vec.get_locked_mut();
+	for i in 0..len {
+	    locked[i].foo += 1000;
+	}
+	// We can still read it back?
+	for i in 0..len {
+	    assert!(locked[i].foo == i + 1000, "Index {} is {}?", i, locked[i].foo);
+	}
+	drop(locked);
+	// Verify that the writes didn't happen to the wrong pages
+	// shadow pages should still have the original layout
+	for (ndx, pg) in shadows.as_slice() {
+	    // Unsafe: Items align to page size, first item is safe
+	    let first: &TestStruct = unsafe {
+		std::mem::transmute::<_, &TestStruct>(*pg as *const u8 as *const TestStruct)
+	    };
+	    // Only test the first item, assume the page is ok if it's ok
+	    assert!(first.foo == ndx * ITEMS_PER_PAGE, "Shadow page {} corrupt, first.foo={}", ndx, first.foo);
+	}
+	drop(shadows); // NB: Shadow must be dropped after locked or we DL :)
+
+	for i in 0..vec.len() {
+	    vec[i].foo -= 1000;
+	}
+	assert_contents(&vec);
     }
 }
