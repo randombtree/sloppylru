@@ -107,6 +107,16 @@ impl PartialOrd<u32> for Slot {
     }
 }
 
+impl PartialOrd<Slot> for Slot {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+	self.0.partial_cmp(&other.0)
+    }
+}
+
+impl Ord for Slot {
+    fn cmp(&self, other: &Self) -> Ordering { self.0.cmp(&other.0) }
+}
+
 impl Eq for Slot {}
 
 impl fmt::Display for Slot {
@@ -116,6 +126,65 @@ impl fmt::Display for Slot {
 	} else {
 	    write!(f, "{}", self.0)
 	}
+    }
+}
+
+
+struct SlotIterator<'a> {
+    items:   &'a PagedVec<LruItem, LRU_PAGE_SIZE>,
+    first:   Slot,
+    current: Slot,
+    offset:  i32,
+}
+
+impl<'a> SlotIterator<'a> {
+    pub fn new(items: &'a PagedVec<LruItem, LRU_PAGE_SIZE>, first: Slot) -> SlotIterator<'a> {
+	let current = first;
+	let offset  = 0;
+	SlotIterator {
+	    items,
+	    first,
+	    current,
+	    offset,
+	}
+    }
+}
+
+impl<'a> Iterator for SlotIterator<'a> {
+    type Item = Slot;
+    fn next(&mut self) -> Option<Self::Item> {
+	// Have we gone a full roundabout
+	if self.offset > 0 && self.current == self.first {
+	    return None
+	} else if self.offset < 0 && self.current == self.first {
+	    // the reverse has gone around, need fixup to continue forward
+	    self.current = self.items[usize::from(self.current)].next();
+	    self.offset += 1;
+	}
+	let current = self.current;
+	let next = self.items[usize::from(self.current)].next();
+	self.current = next;
+	self.offset += 1;
+	Some(current)
+
+    }
+
+}
+
+impl<'a> DoubleEndedIterator for SlotIterator<'a> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+	if self.offset < 0 && self.current == self.first {
+	    return None
+	} else if self.offset > 0 && self.current == self.first {
+	    // The forward iterator has gone around; need fixup
+	    self.current = self.items[usize::from(self.current)].prev();
+	    self.offset -= 1;
+	}
+	let current = self.current;
+	let prev = self.items[usize::from(self.current)].prev();
+	self.current = prev;
+	self.offset -= 1;
+	Some(current)
     }
 }
 
@@ -624,6 +693,78 @@ where
 	})
     }
 
+    /// Do Balance & return recycled slot numbers
+    /// These slots must not be used after the call!
+    pub fn maybe_gc(&mut self) -> Option<Vec<Slot>> {
+	let free_slots = self.levels[usize::from(Self::LEVEL_FREE)].allocated;
+	if free_slots < self.free_hysteresis {
+	    let free_allocated = self.levels[usize::from(Self::LEVEL_FREE_ALLOC)].allocated;
+	    let total_free = free_slots + free_allocated;
+	    if  total_free < self.free_slack {
+		// We are really out of space, need to balance to reclaim some slots
+		let balanced = self.balance();
+		// The balance should always result in at least free_slack total items
+		assert!(balanced >= self.free_slack - total_free);
+	    }
+	    let move_count = self.free_slack - free_slots;
+	    // Adjust book-keeping.
+	    self.levels[usize::from(Self::LEVEL_FREE)].allocated += move_count;
+	    self.levels[usize::from(Self::LEVEL_FREE_ALLOC)].allocated -= move_count;
+
+	    let t_head_ndx = Slot::from(self.size + Self::LEVEL_FREE);
+	    let s_head_ndx = Slot::from(self.size + Self::LEVEL_FREE_ALLOC);
+	    let [t_head, s_head] = self.items.take_refs_mut(
+		[t_head_ndx, s_head_ndx].map(|slot| usize::from(slot)));
+	    let s_last_ndx  = s_head.prev();
+	    let t_first_ndx = t_head.next();  // Can be head!
+	    // Move a chain from source tail to destination, this way we don't
+	    // need to modify that many items
+	    // t_head    / a, b, c \  -> t_first_ndx
+	    // s_head <- \ a, b, c /
+	    // First gather the changed indexes, starting in reverse order.
+	    // Need to take one more for updating of ptrs
+	    let mut indexes: Vec<Slot> = SlotIterator::new(&self.items, s_last_ndx)
+		.rev().take(move_count + 1)/*.map(|slot| usize::from(slot))*/.collect();
+	    let s_remaining_ndx = indexes.pop().unwrap();  // This remains in the list, can be head
+	    let s_first_ndx = Slot::from(indexes[indexes.len() - 1]);
+	    // Can modify these in one swoop without deps
+	    let modified = [s_first_ndx, s_last_ndx, t_head_ndx, s_head_ndx]
+		.map(|slot| usize::from(slot));
+	    let [s_first, s_last, t_head, s_head ] =
+		self.items.take_refs_mut_unsorted(modified);
+
+	    // Link in the first item
+	    s_first.set_prev(t_head_ndx);
+	    t_head.set_next(s_first_ndx);
+
+	    // Link in the last item
+	    s_last.set_next(t_first_ndx);
+	    if t_first_ndx == t_head_ndx {
+		t_head.set_prev(s_last_ndx);
+	    } // Else, do it later to not spoil our mutable references
+
+	    // Heal the source list, linking in the remaining item
+	    s_last.set_next(t_first_ndx);
+	    s_head.set_prev(s_remaining_ndx);
+	    if s_remaining_ndx == s_head_ndx {
+		s_head.set_next(s_head_ndx);
+	    } else {
+		self.items[s_remaining_ndx.into()].set_next(s_head_ndx);
+		self.changes.add(s_remaining_ndx.into());
+	    }
+
+	    if t_first_ndx != t_head_ndx {
+		self.items[t_first_ndx.into()].set_prev(s_last_ndx);
+		self.changes.add(s_last_ndx.into());
+	    }
+
+	    self.changes.add_many(&modified);
+	    Some(indexes)
+	} else {
+	    None
+	}
+    }
+
     /// Balance the levels, i.e. move items down a notch if they overflow the level allowance
     /// Returns count of items returned to the free alloc list (i.e. GC is required).
     pub(crate) fn balance(&mut self) -> usize {
@@ -898,7 +1039,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{VecDeque, HashSet};
+    use std::collections::hash_map::RandomState;
     use std::fs::File;
     use std::io::{Read, Write, Seek, SeekFrom};
 
@@ -995,10 +1137,14 @@ mod tests {
 	println!("LEVEL 1 {:?}", l1_slots);
 	println!("LEVEL 2 {:?}", l2_slots);
 	println!("LEVEL 3 {:?}", l3_slots);
-
-	assert!(compare_level(&l1_slots, lru.level_iter::<L1>()));
-	assert!(compare_level(&l2_slots, lru.level_iter::<L2>()));
-	assert!(compare_level(&l3_slots, lru.level_iter::<L3>()));
+	macro_rules! compare_level {
+	    () => {
+		assert!(compare_level(&l1_slots, lru.level_iter::<L1>()));
+		assert!(compare_level(&l2_slots, lru.level_iter::<L2>()));
+		assert!(compare_level(&l3_slots, lru.level_iter::<L3>()));
+	    }
+	}
+	compare_level!();
 
 
 	// Now fill up all levels (to test availability and, later, the balancer
@@ -1014,10 +1160,7 @@ mod tests {
 	}
 
 	// TODO: Test slot uniqueness
-	assert!(compare_level(&l1_slots, lru.level_iter::<L1>()));
-	assert!(compare_level(&l2_slots, lru.level_iter::<L2>()));
-	assert!(compare_level(&l3_slots, lru.level_iter::<L3>()));
-
+	compare_level!();
 
 	// Try saving and restoring contents
 
@@ -1070,7 +1213,7 @@ mod tests {
 	assert!(balanced == 0);
 	// But now it will overflow; no problems for now however
 	l3_slots.push_back(lru.get(L3).unwrap());
-	assert!(compare_level(&l3_slots, lru.level_iter::<L3>()));
+	compare_level!();
 	// Balance should put one item to the cleaner
 	assert!(lru.balance() == 1);
 
@@ -1083,9 +1226,9 @@ mod tests {
 	// (i.e. last in comparator list)
 	l2_slots.push_back(l3_slots.pop_front().unwrap());
 	l1_slots.push_back(l2_slots.pop_front().unwrap());
-	l1_slots.pop_front(); // <- And this should be in alloc_free list
-	assert!(compare_level(&l2_slots, lru.level_iter::<L2>()));
-	assert!(compare_level(&l3_slots, lru.level_iter::<L3>()));
+	// Save it for later checks
+	let l1_drop = l1_slots.pop_front().unwrap(); // <- And this should be in alloc_free list
+	compare_level!();
 
 	test_checkpoint!();
 
@@ -1097,14 +1240,13 @@ mod tests {
 	lru.promote(l2_promote, Some(1));
 	lru.promote(l3_promote, Some(2));
 
-	assert!(compare_level(&l2_slots, lru.level_iter::<L2>()));
-	assert!(compare_level(&l3_slots, lru.level_iter::<L3>()));
+	compare_level!();
 
 	test_checkpoint!();
 
 	// Promote again; This must also be checked for!
 	lru.promote(l2_promote, Some(1));
-	assert!(compare_level(&l2_slots, lru.level_iter::<L2>()));
+	compare_level!();
 
 	test_checkpoint!();
 
@@ -1114,7 +1256,41 @@ mod tests {
 	    items += 1;
 	    l3_slots.push_back(slot);
 	}
+	compare_level!();
 	trace!("Filled LRU with {} items", items);
+	test_checkpoint!();
+
+	let gc_list = lru.maybe_gc();
+
+	assert!(gc_list.is_some());
+	// Test that we got the "last" items from FREE_ALLOC:
+	// This is a bit fragile, might blow up if logic optimizations are done,
+	// So needs to be re-worked whenever that happens
+	let mut gc_list = gc_list.unwrap();
+	let mut last_l1: Vec<Slot> = l1_slots.iter().take(gc_list.len() - 1).map(|r| *r).collect();
+	// We had a balance test earlier that moved one item to the FREE_ALLOC list, need to include
+	// it here:
+	last_l1.push(l1_drop);
+	gc_list.sort();
+	last_l1.sort();
+	for (n, (gc, l1)) in gc_list.iter().zip(last_l1.iter()).enumerate() {
+	    assert!(gc == l1, "GC didn't collect the expected slot {} at {}, found = {}",
+		    l1, n, gc);
+	 }
+
+	test_checkpoint!();
+
+	// Finally, we should be able to get all the items GC:d back again
+	let gc_count = gc_list.len();
+	let mut gc_set: HashSet<Slot, RandomState> = HashSet::from_iter(gc_list.into_iter());
+	let mut counter = 0;
+	while let Some(slot) = lru.get(L3) {
+	    assert!(gc_set.remove(&slot), "Slot {} not found in GC list? Get #{}", slot, counter);
+	    counter += 1;
+	}
+	// We know all returned items were in gc_set
+	assert!(counter == gc_count, "Get didn't return all GC:d items, {} remaining of {}",
+		gc_count - counter, gc_count);
 
 	test_checkpoint!();
     }
