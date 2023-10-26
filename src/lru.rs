@@ -1,7 +1,12 @@
 use std::cmp::{Ordering};
 use std::convert::{TryInto, TryFrom};
 use std::fmt;
-use std::ops::{Add, Sub, SubAssign};
+use std::ops::{
+    Add,
+    IndexMut,
+    Sub,
+    SubAssign
+};
 use std::cmp::{PartialOrd, PartialEq};
 
 use log::{
@@ -129,16 +134,22 @@ impl fmt::Display for Slot {
     }
 }
 
-
-struct SlotIterator<'a> {
-    items:   &'a PagedVec<LruItem, LRU_PAGE_SIZE>,
+struct SlotIterator<'a, I>
+where I: IndexMut<usize, Output = LruItem>
+{
+    items:   &'a mut I,
     first:   Slot,
     current: Slot,
     offset:  i32,
 }
 
-impl<'a> SlotIterator<'a> {
-    pub fn new(items: &'a PagedVec<LruItem, LRU_PAGE_SIZE>, first: Slot) -> SlotIterator<'a> {
+impl<'a, I> SlotIterator<'a, I>
+where I: IndexMut<usize, Output = LruItem>
+{
+    /// Construct a SlotIterator
+    /// SlotIterator is unsafe, as it's possible to get multiple mutable references to the same items
+    /// if you really want to!
+    pub unsafe fn new(items: &'a mut I, first: Slot) -> SlotIterator<'a, I> {
 	let current = first;
 	let offset  = 0;
 	SlotIterator {
@@ -150,8 +161,10 @@ impl<'a> SlotIterator<'a> {
     }
 }
 
-impl<'a> Iterator for SlotIterator<'a> {
-    type Item = Slot;
+impl<'a, I> Iterator for SlotIterator<'a, I>
+where I: IndexMut<usize, Output = LruItem>
+{
+    type Item = (Slot, &'a mut LruItem);
     fn next(&mut self) -> Option<Self::Item> {
 	// Have we gone a full roundabout
 	if self.offset > 0 && self.current == self.first {
@@ -162,16 +175,24 @@ impl<'a> Iterator for SlotIterator<'a> {
 	    self.offset += 1;
 	}
 	let current = self.current;
-	let next = self.items[usize::from(self.current)].next();
+	let current_item = &mut self.items[usize::from(self.current)];
+	let next = current_item.next();
 	self.current = next;
 	self.offset += 1;
-	Some(current)
-
+	// HACK ALERT:
+	// This is a hack to overcome the inability to safely guarantee that
+	// multiple mutable ptr:s to the same item aren't passed back
+	// In our local usage, this works, but i general this can't be guaranteed!
+	let current_ptr = current_item as *mut LruItem;
+	// Unsafe: This IS unsafe, and will shoot you in the foot quite easily.
+	Some((current, unsafe { std::mem::transmute::<_, &mut LruItem>(current_ptr)} ))
     }
 
 }
 
-impl<'a> DoubleEndedIterator for SlotIterator<'a> {
+impl<'a, I> DoubleEndedIterator for SlotIterator<'a, I>
+where I: IndexMut<usize, Output = LruItem>
+{
     fn next_back(&mut self) -> Option<Self::Item> {
 	if self.offset < 0 && self.current == self.first {
 	    return None
@@ -181,10 +202,14 @@ impl<'a> DoubleEndedIterator for SlotIterator<'a> {
 	    self.offset -= 1;
 	}
 	let current = self.current;
-	let prev = self.items[usize::from(self.current)].prev();
+	let current_item = &mut self.items[usize::from(self.current)];
+	let prev = current_item.prev();
 	self.current = prev;
 	self.offset -= 1;
-	Some(current)
+	// HACK ALERT: Read the note in next() above
+	let current_ptr = current_item as *mut LruItem;
+	// Unsafe: ditto!
+	Some((current, unsafe { std::mem::transmute::<_, &mut LruItem>(current_ptr)} ))
     }
 }
 
@@ -501,7 +526,7 @@ impl<const N: usize> LruChangeTracker<N> {
     }
 
     /// Convinience function to add many changes, see: `add`.
-    fn add_many<const S: usize>(&mut self, indexes: &[usize; S]) {
+    fn add_many(&mut self, indexes: &[usize]) {
 	for i in indexes {
 	    self.add(*i);
 	}
@@ -536,7 +561,7 @@ where [(); N + 2]: Sized
 macro_rules! name_index {
     ($name:ident, $list: expr, $ndx:ident) => {
 	macro_rules! $name {
-	    () => { ($list[$ndx]) }
+	    () => { ($list[$ndx.into()]) }
 	}
     }
 }
@@ -711,54 +736,57 @@ where
 	    self.levels[usize::from(Self::LEVEL_FREE)].allocated += move_count;
 	    self.levels[usize::from(Self::LEVEL_FREE_ALLOC)].allocated -= move_count;
 
+	    let mut items = self.items.get_locked_mut();
+
 	    let t_head_ndx = Slot::from(self.size + Self::LEVEL_FREE);
 	    let s_head_ndx = Slot::from(self.size + Self::LEVEL_FREE_ALLOC);
-	    let [t_head, s_head] = self.items.take_refs_mut(
-		[t_head_ndx, s_head_ndx].map(|slot| usize::from(slot)));
-	    let s_last_ndx  = s_head.prev();
-	    let t_first_ndx = t_head.next();  // Can be head!
+	    name_index!(t_head, items, t_head_ndx);
+	    name_index!(s_head, items, s_head_ndx);
+
+	    let s_last_ndx  = s_head!().prev();
+	    let t_first_ndx = t_head!().next();  // Can be head!
+	    name_index!(s_last, items, s_last_ndx);
+	    name_index!(t_first, items, t_first_ndx);
 	    // Move a chain from source tail to destination, this way we don't
 	    // need to modify that many items
 	    // t_head    / a, b, c \  -> t_first_ndx
 	    // s_head <- \ a, b, c /
 	    // First gather the changed indexes, starting in reverse order.
-	    // Need to take one more for updating of ptrs
-	    let mut indexes: Vec<Slot> = SlotIterator::new(&self.items, s_last_ndx)
-		.rev().take(move_count + 1)/*.map(|slot| usize::from(slot))*/.collect();
-	    let s_remaining_ndx = indexes.pop().unwrap();  // This remains in the list, can be head
+	    // Unsafe: Not changing direction of iterator, so SlotIterator is safe.
+	    let indexes: Vec<Slot> = unsafe { SlotIterator::new(&mut items, s_last_ndx) }
+		.rev().take(move_count)
+		.map(|(slot, item)| {
+		    item.set_level(Self::LEVEL_FREE);
+		    slot
+		}).collect();
+
 	    let s_first_ndx = Slot::from(indexes[indexes.len() - 1]);
-	    // Can modify these in one swoop without deps
-	    let modified = [s_first_ndx, s_last_ndx, t_head_ndx, s_head_ndx]
-		.map(|slot| usize::from(slot));
-	    let [s_first, s_last, t_head, s_head ] =
-		self.items.take_refs_mut_unsorted(modified);
+	    name_index!(s_first, items, s_first_ndx);
+	    // The remaining item, is the previous one (remember, we walked backwards)
+	    let s_remaining_ndx = s_first!().prev();
+	    name_index!(s_remaining, items, s_remaining_ndx);
 
 	    // Link in the first item
-	    s_first.set_prev(t_head_ndx);
-	    t_head.set_next(s_first_ndx);
+	    s_first!().set_prev(t_head_ndx);
+	    t_head!().set_next(s_first_ndx);
 
 	    // Link in the last item
-	    s_last.set_next(t_first_ndx);
-	    if t_first_ndx == t_head_ndx {
-		t_head.set_prev(s_last_ndx);
-	    } // Else, do it later to not spoil our mutable references
+	    s_last!().set_next(t_first_ndx);
+	    t_first!().set_prev(s_last_ndx);
 
 	    // Heal the source list, linking in the remaining item
-	    s_last.set_next(t_first_ndx);
-	    s_head.set_prev(s_remaining_ndx);
-	    if s_remaining_ndx == s_head_ndx {
-		s_head.set_next(s_head_ndx);
-	    } else {
-		self.items[s_remaining_ndx.into()].set_next(s_head_ndx);
-		self.changes.add(s_remaining_ndx.into());
-	    }
+	    s_last!().set_next(t_first_ndx);
+	    s_head!().set_prev(s_remaining_ndx);
+	    s_remaining!().set_next(s_head_ndx);
 
-	    if t_first_ndx != t_head_ndx {
-		self.items[t_first_ndx.into()].set_prev(s_last_ndx);
-		self.changes.add(s_last_ndx.into());
-	    }
+	    let mut modified: Vec<usize> = indexes.iter().map(|slot| (*slot).into()).collect();
+	    // We also modified the heads and the link in/out items.
+	    modified.push(s_head_ndx.into());
+	    modified.push(t_head_ndx.into());
+	    modified.push(t_first_ndx.into());
+	    modified.push(s_remaining_ndx.into());
 
-	    self.changes.add_many(&modified);
+	    self.changes.add_many(modified.as_slice());
 	    Some(indexes)
 	} else {
 	    None
