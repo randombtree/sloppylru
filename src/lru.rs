@@ -729,11 +729,22 @@ where
 	})
     }
 
+    /// Are we on the hysteresis point
+    /// Caller can determine when to initiate preemptive GC
+    pub fn on_gc_hysteresis(&self) -> bool {
+	self.levels[usize::from(Self::LEVEL_FREE)].allocated == self.free_hysteresis
+    }
+
+    /// Does this LRU need garbage collection
+    pub fn needs_gc(&self) -> bool {
+	self.levels[usize::from(Self::LEVEL_FREE)].allocated <= self.free_hysteresis
+    }
+
     /// Do Balance & return recycled slot numbers
     /// These slots must not be used after the call!
     pub fn maybe_gc(&mut self) -> Option<Vec<Slot>> {
 	let free_slots = self.levels[usize::from(Self::LEVEL_FREE)].allocated;
-	if free_slots < self.free_hysteresis {
+	if self.needs_gc() {
 	    let free_allocated = self.levels[usize::from(Self::LEVEL_FREE_ALLOC)].allocated;
 	    let total_free = free_slots + free_allocated;
 	    if  total_free < self.free_slack {
