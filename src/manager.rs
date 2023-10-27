@@ -115,12 +115,20 @@ where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::Path;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
     use futures::future::Future;
     use futures::join;
     use rand;
     use smol;
     use test_log::test;
+
+    use log::{
+	trace,
+    };
 
     use crate::cache::Cache;
     use crate::config::CacheConfig;
@@ -133,9 +141,10 @@ mod tests {
 
     const LEVELS: usize    = 2;
     const KEY_BYTES: usize = 64;
-    const CACHE_SIZE_PAGES: usize = 20;
+    const CACHE_SIZE_PAGES: usize = 10;
     type MyManager = CacheManager<LEVELS, KEY_BYTES>;
     type MyCache   = Cache<LEVELS, KEY_BYTES>;
+    type MyKey     = Key<KEY_BYTES>;
 
     fn open_manager<P: AsRef<Path>>(path: P) -> Result<MyManager> {
 	MyManager::open(path)
@@ -147,12 +156,14 @@ mod tests {
     }
 
     fn get_config(pages: usize) -> CacheConfig<LEVELS> {
-	CacheConfig::default(pages * lru::LRU_PAGE_SIZE)
+	CacheConfig::default(pages * lru::ITEMS_PER_PAGE)
     }
 
-    async fn open_cache(manager: &MyManager, name: &str) -> (MyCache, impl Future<Output = ()>) {
+    async fn open_cache<F>(manager: &MyManager, name: &str, purger: F) -> (MyCache, impl Future<Output = ()>)
+	where F: FnMut(Vec<usize>) + Send +'static,
+    {
 	let cache = manager.new_cache(name, get_config(CACHE_SIZE_PAGES)).unwrap();
-	let flusher = cache.run().await;
+	let flusher = cache.run(purger);
 	let task = smol::spawn(async move { flusher.await });
 	(cache, task)
     }
@@ -160,19 +171,23 @@ mod tests {
     #[test]
     fn test_manager() {
 	smol::block_on(async {
+	    let config  = get_config(CACHE_SIZE_PAGES);
 	    let db_path = TestPath::new("test_manager").unwrap();
 	    let manager = open_manager(db_path).unwrap();
 	    macro_rules! open_cache {
+		($purger:expr) => {
+		    open_cache(&manager, "my_cache", $purger).await
+		};
 		() => {
-		    open_cache(&manager, "my_cache").await
-		}
+		    open_cache!(|list| trace!("Freed {:?}", list))
+		};
 	    }
 	    let (cache, flusher) = open_cache!();
-	    let (cache2, flusher2) = open_cache(&manager, "other_cache").await;
+	    let (cache2, flusher2) = open_cache(&manager, "other_cache", |_l| {}).await;
 	    let key = gen_key();
 	    let key2 = gen_key();
-	    let slot = cache.insert(&key, 1).await;
-	    let slot2 = cache2.insert(&key2, 1).await;
+	    let slot = cache.insert(&key, 1).await.unwrap();
+	    let slot2 = cache2.insert(&key2, 1).await.unwrap();
 	    // The insertion method is deterministic at the moment, so both slots should be the "same".
 	    assert!(slot == slot2);
 	    macro_rules! verify_key {
@@ -192,8 +207,47 @@ mod tests {
 	    // Test re-loading
 	    drop(cache);
 	    flusher.await;
-	    let (cache, flusher) = open_cache!();
+	    let inserted_items = Arc::new(Mutex::new(HashMap::new()));
+	    let removed_items  = Arc::new(Mutex::new(HashMap::new()));
+	    let inserted_dup = inserted_items.clone();
+	    let removed_dup  = removed_items.clone();
+
+	    // Also test purger method
+	    let (cache, flusher) = open_cache!(move |list| {
+		let mut inserted_items = inserted_dup.lock().unwrap();
+		let mut removed_items  = removed_dup.lock().unwrap();
+		for slot in list {
+		    let key = inserted_items.remove(&slot).expect("Removed item wasn't inserted?");
+		    removed_items.insert(slot, key);
+		}
+
+	    });
 	    verify_key!(cache, key, slot, "Key not found after reload?");
+	    inserted_items.lock().unwrap().insert(slot, key);
+	    // Fill'er up
+	    // This should fill the whole LRU kicking "key" inserted above away
+	    // TODO: waiting for a sequential async map ..
+	    trace!("TEST GC: Filling up");
+	    // The calculation here is to at least provoke a GC, but not too much to
+	    // kick the newly inserted items out.
+	    let insert_count = lru::ITEMS_PER_PAGE * CACHE_SIZE_PAGES - config.free_slack/2 + 1;
+	    for _ in 0..insert_count {
+		let key = gen_key();
+		let slot = cache.insert(&key, 1).await.unwrap();
+		let mut items = inserted_items.lock().unwrap();
+		let mut removed = removed_items.lock().unwrap();
+		items.insert(slot, key);
+		// The last item will at least be there
+		removed.remove(&slot);
+	    }
+
+	    assert!(removed_items.lock().unwrap().len() > 0);
+
+	    trace!("TEST GC: Validating keys");
+	    for (slot, key) in inserted_items.lock().unwrap().iter() {
+		let ret = cache.get(key, None).expect("Expected key to be in LRU");
+		assert!(*slot == ret, "Cache slot number mismatch!?");
+	    }
 
 	    drop(cache);
 	    drop(cache2);

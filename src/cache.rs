@@ -14,9 +14,6 @@ use log::{
 
 use sled;
 use sled::Transactional;
-use sled::transaction::{
-    abort,
-};
 
 use crate::result::{
     Error,
@@ -74,10 +71,67 @@ pub (crate) enum FlusherMsg {
     /// Collect old entries to make room for new ones in LRU
     GC,
     /// Emergency GC, sender is waiting for free space
-    GC_SYNC(oneshot::Sender<()>),
+    GcSync(oneshot::Sender<()>),
     /// Shut down flusher
     SHUTDOWN,
 }
+
+/// Async flusher of Cache; Runs without references
+async fn flusher<const N: usize, const K: usize, F>(this: Weak<CacheInner<N, K>>, mut receiver: mpsc::Receiver<FlusherMsg>, mut purger: F)
+where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized,
+      F: FnMut(Vec<usize>),
+{
+    trace!("Flusher running...");
+    while let Some(msg) = receiver.next().await {
+	use FlusherMsg::*;
+	let mut maybe_gc = |this: Arc<CacheInner<N,K>>| {
+	    match this.maybe_gc() {
+		Ok(slots) if slots.len() > 0 => {
+		    purger(slots.iter().map(|slot| (*slot).into()).collect())
+		},
+		Ok(_slots) => {
+		    // This might indicate a problem
+		    warn!("GC Unsuccessful?")
+		},
+		Err(e) => match e {
+		    Error::LRUBackoff => trace!("LRU Backoff"),
+		    _ => warn!("GC Error {:?}", e),
+		}
+	    }
+	};
+	match msg {
+	    GC => {
+		if let Some(this) = this.upgrade() {
+		    trace!("Opportunistic GC");
+		    maybe_gc(this);
+		}
+	    },
+	    GcSync(sender) => {
+		trace!("Sync GC requested");
+		if let Some(this) = this.upgrade() {
+		    maybe_gc(this)
+		} else {
+		    // Shouldn't happen, somewhere the waiter didn't wait.
+		    warn!("Cache disappeared under flusher!");
+		}
+		// Really, just crash if the channel fails.. something is really bad
+		sender.send(()).expect("Failed to wake up waiter");
+	    },
+	    SHUTDOWN => break,
+	}
+    }
+    debug!("Stopping flusher for cache");
+
+    // Generally the shutdown should only happen on drop,
+    // so this should not be run anyway; but just to be future-proof..
+    if let Some(this) = this.upgrade() {
+	warn!("Shutting down flusher while cache '{}' still active..", this.name);
+	let mut rw = this.rw.write().unwrap();
+	// Give it back
+	rw.flusher_receiver = Some(receiver);
+    }
+}
+
 
 impl<const N: usize, const K: usize> Cache<N, K>
 where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized {
@@ -150,9 +204,13 @@ where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized {
     }
 
     /// Returns flusher function closure that must be run
+    /// The user should provide a purger function to handle automatic
+    /// cache evictions. The purger is called with a list of slots that have
+    /// been free'd.
     /// Returns a future that sheds the references to the cache.
-    pub async fn run(&self) -> impl Future<Output = ()> {
-	let mut receiver =  {
+    pub fn run<F>(&self, purger: F) -> impl Future<Output = ()>
+    where F: FnMut(Vec<usize>) {
+	let receiver =  {
 	    let mut rw = self.0.rw.write().unwrap();
 	    debug!("Starting flusher for cache '{}'", self.0.name);
 	    // Crash if run multiple times
@@ -162,61 +220,38 @@ where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized {
 	let weak_this = Arc::downgrade(&self.0);
 
 	let func = async move {
-	    trace!("Flusher running...");
-	    while let Some(msg) = receiver.next().await {
-		use FlusherMsg::*;
-		match msg {
-		    GC => { todo!() },
-		    GC_SYNC(_sender) => { todo!() },
-		    SHUTDOWN => break,
-		}
-	    }
-	    debug!("Stopping flusher for cache");
-
-	    // Generally the shutdown should only happen on drop,
-	    // so this should not be run anyway; but just to be future-proof..
-	    if let Some(this) = weak_this.upgrade() {
-		warn!("Shutting down flusher while cache '{}' still active..", this.name);
-		let mut rw = this.rw.write().unwrap();
-		// Give it back
-		rw.flusher_receiver = Some(receiver);
-	    }
+	    flusher(weak_this, receiver, purger).await;
 	};
 	func
     }
 
-    /// Insert key into LRU
+    /// Insert key into LRU. Key collisions are not handled, so an insert will always
+    /// return a new slot number wheras the old one will be re-used later.
     /// Returns slot number
-    pub async fn insert(&self, key: &Key<K>, level: usize) -> usize
+    pub async fn insert(&self, key: &Key<K>, level: usize) -> Result<usize>
     {
 	assert!(level < N);
 	let inner = &self.0;
 	// TODO: GC wakeup logic goes here
 	loop {
 	    // TODO: LRU slot transaction
-	    let mut rw = inner.rw.write().unwrap();
-	    if let Some(slot) = rw.lru.get(level) {
-		// Get the lru changes up to now.
-		let (lru_meta, lru_shadow) = rw.lru.checkpoint();
-		let res =
-		    (&inner.tree, &inner.rtree, &inner.lru_tree)
-		    .transaction(|(tx_tree, tx_rtree, tx_lru)| {
-			tx_tree.insert(key.as_ref(), sled::IVec::from(slot))?;
-			tx_rtree.insert(&slot.as_key(), key.as_ref())?;
-			for (pg_num, data) in lru_shadow.as_slice().iter() {
-			    tx_lru.insert(LruBlockKey::from(*pg_num).as_ref(), data.as_slice())?;
+	    let ret = inner.get_lru(key, level).and_then(|slot| Ok(slot.into()));
+	    match ret {
+		Ok(slot) => {
+		    return Ok(slot);
+		},
+		Err(e) => {
+		    match e {
+			Error::LRUFull => {
+			    trace!("LRU Full, waking GC");
+			    inner.wake_gc_sync().await;
 			}
-			tx_lru.insert(LRU_META_KEY.as_ref(), &*lru_meta)?;
-			if false {
-			    abort(())?;
+			_ => {
+			    trace!("Transaction failed ({:?}, aborting", e);
+			    return Err(e);
 			}
-			Ok(usize::from(slot))
-		    });
-		if let Ok(slot) = res {
-		    return slot;
-		} else {
-		    trace!("Transaction failed ({:?}, retrying...", res.unwrap_err());
-		}
+		    }
+		},
 	    }
 	}
     }
@@ -240,6 +275,7 @@ where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized {
     }
 }
 
+
 struct CacheInner<const N: usize, const K: usize>
 where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized
 {
@@ -252,6 +288,112 @@ where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized
     /// Sled sub-keyspace for lru block storage
     lru_tree: sled::Tree,
     rw: RwLock<CacheConcurrent<N>>,
+}
+
+impl<const N: usize, const K: usize> CacheInner<N, K>
+    where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized {
+
+    // Wake flusher for GC work and wait for completion
+    async fn wake_gc_sync(&self) {
+	let (sender, receiver) = oneshot::channel::<()>();
+	let mut rw = self.rw.write().unwrap();
+	let ret = rw.flusher_sender.try_send(FlusherMsg::GcSync(sender));
+	drop(rw);
+	// If sending fails, the queue is stuffed and we have a crash/lock in flusher
+	if let Ok(_) = ret {
+	    receiver.await.expect("Waiting for flusher failed?")
+	}
+    }
+
+    /// Transactional get LRU
+    fn get_lru(&self, key: &Key<K>, level: usize) -> Result<Slot> {
+	let mut rw = self.rw.write().unwrap();
+	rw.lru.get(level)
+	    .ok_or(Error::LRUFull)
+	    .and_then(|slot| {
+		let (lru_meta, lru_shadow) = rw.lru.checkpoint();
+		(&self.tree, &self.rtree, &self.lru_tree)
+		    .transaction(|(tx_tree, tx_rtree, tx_lru)| {
+			let other_slot = tx_tree.insert(key.as_ref(), sled::IVec::from(slot))?;
+			if let Some(iv) = other_slot {
+			    // Key collision, key is inserted a second time
+			    let slot: Slot = iv.into();
+			    // TODO: Handle this in some way..
+			    warn!("Key collision on slot {}", slot);
+			    // LRU2 GC will take care of it in time..
+			    // Remove here so that key mapping isn't removed when this slot runs out.
+			    tx_rtree.remove(&slot.as_key())?;
+			}
+			tx_rtree.insert(&slot.as_key(), key.as_ref())?;
+			for (pg_num, data) in lru_shadow.as_slice().iter() {
+			    tx_lru.insert(LruBlockKey::from(*pg_num).as_ref(), data.as_slice())?;
+			}
+			tx_lru.insert(LRU_META_KEY.as_ref(), &*lru_meta)?;
+			Ok(slot)
+		    }).map_err(|e| e.into())
+	    }).and_then(|slot| {
+		if rw.lru.on_gc_hysteresis() {
+		    trace!("LRU hysteresis, order GC");
+		    // Try to wake flusher
+		    let _ = rw.flusher_sender.try_send(FlusherMsg::GC);
+		}
+		Ok(slot)
+	    })
+    }
+
+    /// Try to do GC
+    /// Returns list of GC'd Slots, LRUBackoff if there is enough space in the LRU
+    /// Or other error happened during the DB update.
+    fn maybe_gc(&self) -> Result<Vec<Slot>> {
+	let mut rw = self.rw.write().unwrap();
+	rw.lru.maybe_gc()
+	    .ok_or(Error::LRUBackoff)
+	    .and_then(|list| {
+		let (lru_meta, lru_shadow) = rw.lru.checkpoint();
+		(&self.tree, &self.rtree, &self.lru_tree)
+		    .transaction(|(tx_tree, tx_rtree, tx_lru)| {
+			let mut errors = 0;
+			let mut slot_err = None;
+			let mut key_err  = None;
+			let slots: Vec<Slot> =
+			    list.iter().map(|slot|
+					    tx_rtree.remove(&slot.as_key())
+					    .map_or_else(|e| {
+						// We save one DB error
+						errors += 1;
+						slot_err = Some(e.clone());
+						(*slot, None)
+					    }, |some| (*slot, some)))
+			    .filter(|(_, o)| o.is_some())
+			    .map(|(slot, some)| {
+				// If this errs, we are really in a broken DB
+				// In key collisions the key -> slot mapping
+				let _ = tx_tree.remove(some.unwrap())
+				    .or_else(|e| {
+					key_err = Some(e.clone());
+					Err(e)
+				    });
+				slot
+			    })
+			    .collect();
+			if slot_err.is_some() || key_err.is_some() {
+			    warn!("DB Errors {} errors in total, {} keys removed",
+				  errors, slots.len());
+			    // TODO: Do something useful, Abort?
+			}
+
+			// Save LRU data
+			for (pg_num, data) in lru_shadow.as_slice().iter() {
+			    tx_lru.insert(LruBlockKey::from(*pg_num).as_ref(), data.as_slice())?;
+			}
+			tx_lru.insert(LRU_META_KEY.as_ref(), &*lru_meta)?;
+
+			// Only return the successful ones
+			// Not sure if we could fall into a case where LRU and DB disagrees though..
+			Ok(slots)
+		    }).or_else(|e| Err(e.into()))
+	    })
+    }
 }
 
 impl<const N: usize, const K: usize> Drop for CacheInner<N, K>
