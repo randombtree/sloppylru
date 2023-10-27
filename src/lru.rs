@@ -112,6 +112,13 @@ impl PartialOrd<u32> for Slot {
     }
 }
 
+impl PartialOrd<usize> for Slot {
+    fn partial_cmp(&self, other: &usize) -> Option<Ordering> {
+	let other = Slot::from(*other);
+	self.partial_cmp(&other)
+    }
+}
+
 impl PartialOrd<Slot> for Slot {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 	self.0.partial_cmp(&other.0)
@@ -913,6 +920,48 @@ where
 	Some(slot)
     }
 
+    /// Put (relinquish) previously acquired slot (from `get`)
+    pub fn put(&mut self, slot: Slot) {
+	assert!(slot < self.size);
+	let t_head_ndx: Slot = self.level_head(Self::LEVEL_FREE).into();
+	let mut items = self.items.get_locked_mut();
+	name_index!(item, items, slot);
+	let src_level = item!().level();
+	if src_level == Self::LEVEL_FREE {
+	    // This isn't fatal, and migh as well be due to (controlled race) optimizations in the caller
+	    trace!("Putting free item?");
+	    return;
+	}
+
+	self.levels[usize::from(src_level)].allocated        -= 1;
+	self.levels[usize::from(Self::LEVEL_FREE)].allocated += 1;
+
+	name_index!(t_head, items, t_head_ndx);
+
+	let t_first_ndx = t_head!().next();
+	let s_next_ndx  = item!().next();
+	let s_prev_ndx  = item!().prev();
+	name_index!(t_first, items, t_first_ndx);
+	name_index!(s_next, items, s_next_ndx);
+	name_index!(s_prev, items, s_prev_ndx);
+
+	// Link in item (and set level)
+	item!().set_level(Self::LEVEL_FREE);
+	item!().set_next(t_first_ndx);
+	item!().set_prev(t_head_ndx);
+	t_head!().set_next(slot);
+	t_first!().set_prev(slot);
+
+	// Patch hole
+	s_next!().set_prev(s_prev_ndx);
+	s_prev!().set_next(s_next_ndx);
+
+	// Changed these 5 indexes
+	self.changes.add_many(
+	    &[slot, t_head_ndx, t_first_ndx, s_prev_ndx, s_next_ndx]
+		.map(|slot| slot.into()))
+    }
+
     /// Promote slot - it moves to the top of its level
     /// @level Optionally specify a different level to move into (this can also
     ///        de-promote the slot)
@@ -1282,6 +1331,15 @@ mod tests {
 
 	test_checkpoint!();
 
+	// Relinquish item
+	let put_slot = l3_slots.pop_back().unwrap();
+	lru.put(put_slot);
+	// A second put should not cause any problems
+	lru.put(put_slot);
+	compare_level!();
+
+	test_checkpoint!();
+
 	// Test GC, first fill it up
 	let mut items = 0;
 	while let Some(slot) = lru.get(L3) {
@@ -1325,5 +1383,15 @@ mod tests {
 		gc_count - counter, gc_count);
 
 	test_checkpoint!();
+    }
+
+    /// Test too large slot put
+    #[test]
+    #[should_panic]
+    fn test_put_large_slot() {
+	let config = CacheConfig::<LEVELS>::default(SIZE);
+	let mut lru = LruArray::new(&config);
+
+	lru.put(SIZE.into());
     }
 }
