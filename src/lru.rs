@@ -597,6 +597,10 @@ macro_rules! take_two_refs {
 /// Page size used when writing LRU to stable storage.
 pub const LRU_PAGE_SIZE: usize = 4096;
 
+/// How many items are stored per LRU page.
+/// For testing and optimization of page usage
+pub const ITEMS_PER_PAGE: usize = LRU_PAGE_SIZE / std::mem::size_of::<LruItem>();
+
 pub(crate) struct LruArray<const N: usize>
 where
     [(); 14 - N]: Sized, // 4 bits for levels -> 16 - 2 = 14 levels
