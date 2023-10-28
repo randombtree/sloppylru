@@ -305,6 +305,25 @@ impl<const N: usize, const K: usize> CacheInner<N, K>
 	}
     }
 
+    /// Save LRU changes to DB
+    fn sync(&self) -> Result<()> {
+	let mut rw = self.rw.write().unwrap();
+	let (lru_meta, lru_shadow) = rw.lru.checkpoint();
+	let pages = lru_shadow.as_slice();
+	if pages.len() > 0 {
+	    trace!("Syncing {} pages", pages.len());
+	    self.lru_tree.transaction(|tx_lru| {
+		for (pg_num, data) in pages {
+		    tx_lru.insert(LruBlockKey::from(*pg_num).as_ref(), data.as_slice())?;
+		}
+		tx_lru.insert(LRU_META_KEY.as_ref(), &*lru_meta)?;
+		Ok(())
+	    }).map_err(|e| e.into())
+	} else {
+	    Ok(())
+	}
+    }
+
     /// Transactional get LRU
     fn get_lru(&self, key: &Key<K>, level: usize) -> Result<Slot> {
 	let mut rw = self.rw.write().unwrap();
@@ -402,6 +421,11 @@ where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized
     fn drop(&mut self) {
 	debug!("Cache {} shutting down", self.name);
 	self.manager.purge_cache_cb(&self.name);
+	// Sync cache to disk
+	if let Err(e) = self.sync() {
+	    // Not much one can do..
+	    error!("Unable to sync LRU to disk on closing: {:?}", e);
+	}
 	// Shut down flusher
 	let mut rw = self.rw.write().unwrap();
 	if let Err(_) = rw.flusher_sender.try_send(FlusherMsg::SHUTDOWN) {
