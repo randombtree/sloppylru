@@ -802,6 +802,7 @@ mod tests {
     fn test_create() {
 	let vec = create_pvec();
 	assert_contents(&vec);
+	assert!(vec.len() == CAPACITY);
     }
 
     #[test]
