@@ -34,6 +34,7 @@ pub mod result;
 pub use manager::CacheManager;
 pub use config::CacheConfig;
 pub use cache::Cache;
+pub use lru::ITEMS_PER_PAGE;
 
 pub use result::{Result, Error};
 // DocTest needs this, so need to live with it

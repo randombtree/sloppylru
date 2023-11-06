@@ -31,7 +31,6 @@ where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized
 pub struct CacheManagerInner<const N: usize, const K: usize>
 where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized {
     db:   sled::Db,
-    path: std::path::PathBuf,
     caches: RwLock<HashMap<String, WeakCache<N, K>>>,
 }
 
@@ -69,7 +68,6 @@ where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized
 
 	Ok(CacheManager(Arc::new(CacheManagerInner {
 	    db,
-	    path,
 	    caches,
 	})))
     }
@@ -109,7 +107,6 @@ where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized
     }
 
     pub(crate) fn db(&self) -> &sled::Db { &self.0.db }
-    pub(crate) fn path(&self) -> &std::path::Path { &self.0.path.as_ref() }
 }
 
 
@@ -144,7 +141,6 @@ mod tests {
     const CACHE_SIZE_PAGES: usize = 10;
     type MyManager = CacheManager<LEVELS, KEY_BYTES>;
     type MyCache   = Cache<LEVELS, KEY_BYTES>;
-    type MyKey     = Key<KEY_BYTES>;
 
     fn open_manager<P: AsRef<Path>>(path: P) -> Result<MyManager> {
 	MyManager::open(path)

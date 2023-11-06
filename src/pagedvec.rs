@@ -392,7 +392,6 @@ where
     T: Sized  + Clone + 'static,
 [T; N]: Sized,
 {
-    const ITEMS_PER_PAGE: usize = ShadowRegisterInner::<T,N>::ITEMS_PER_PAGE;
     fn new(shadow: MutexGuard<'a, ShadowRegisterInner<T,N>>) -> LockedPagedVec<'a, T, N> {
 	LockedPagedVec { shadow }
     }
@@ -519,6 +518,7 @@ where
 	})
     }
 
+    #[allow(dead_code)]
     pub fn len(&self) -> usize { self.capacity }
 
     /// Get the number of pages in this PageVec

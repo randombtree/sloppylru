@@ -232,9 +232,7 @@ where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized {
     {
 	assert!(level < N);
 	let inner = &self.0;
-	// TODO: GC wakeup logic goes here
 	loop {
-	    // TODO: LRU slot transaction
 	    let ret = inner.get_lru(key, level).and_then(|slot| Ok(slot.into()));
 	    match ret {
 		Ok(slot) => {
@@ -267,11 +265,6 @@ where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized {
 	let mut rw = inner.rw.write().unwrap();
 	rw.lru.promote(slot, level);
 	Some(usize::from(slot))
-    }
-
-    /// Evict key from LRU
-    pub fn evict(&self, key: &Key<K>) -> Option<()> {
-	todo!();
     }
 }
 

@@ -34,11 +34,9 @@ pub(crate) struct Slot(u32);
 impl Slot {
     pub const SLOT_MASK:u32 = (1 << 30) - 1; // 2 high bits unavailable, See LruItem
     pub const NIL:Slot = Slot(u32::MAX & Self::SLOT_MASK);
-    pub const MAX:Slot = Slot(Self::NIL.0 - 1);
     pub fn as_key(&self) -> [u8;4] {
 	self.0.to_be_bytes()
     }
-    pub fn is_nil(&self) -> bool { self.0 == Self::NIL.0 }
 }
 
 
@@ -308,7 +306,6 @@ impl LruItem {
     const LEVEL_BITS: u64    = 4;
     const LEVEL_MASK: u64    = ((1 << Self::LEVEL_BITS) - 1) << Self::LEVEL_SHIFT;
     const LEVEL_MAX: u8      = ((1 << Self::LEVEL_BITS) - 1) as u8;
-    const DETACHED: u64   = !0u64;
 
     pub(crate) fn new(prev: Slot, next: Slot, level: Level) -> Self {
 	let prev: u64 = prev.into();
@@ -342,16 +339,6 @@ impl LruItem {
 	let level = (level.0 as u64) << Self::LEVEL_SHIFT;
 	self.0 = level | (self.0 & !Self::LEVEL_MASK);
     }
-
-    /// Set this item to a detched state; this is mostly a debug aid
-    /// to track invalid modifications of the node.
-    pub(crate) fn set_detached(&mut self) {
-	self.0 = Self::DETACHED;
-    }
-
-    pub(crate) fn is_detached(&mut self) -> bool {
-	self.0 == Self::DETACHED
-    }
 }
 
 
@@ -363,7 +350,8 @@ struct LevelState {
 }
 
 
-// Iterator over a specific LRU level
+/// Iterator over a specific LRU level
+#[cfg(test)]
 pub(crate) struct LevelIterator<'a, const N: usize>
     where
     [(); 14 - N]: Sized, // 4 bits for levels -> 16 - 2 = 14 levels
@@ -375,7 +363,7 @@ pub(crate) struct LevelIterator<'a, const N: usize>
     current: Option<Slot>,
 }
 
-
+#[cfg(test)]
 impl<'a, const N: usize> LevelIterator<'a, N>
     where
     [(); 14 - N]: Sized, // 4 bits for levels -> 16 - 2 = 14 levels
@@ -393,7 +381,7 @@ impl<'a, const N: usize> LevelIterator<'a, N>
     }
 }
 
-
+#[cfg(test)]
 impl<'a, const N: usize> Iterator for LevelIterator<'a, N>
         where
     [(); 14 - N]: Sized, // 4 bits for levels -> 16 - 2 = 14 levels
@@ -932,6 +920,7 @@ where
     }
 
     /// Put (relinquish) previously acquired slot (from `get`)
+    #[allow(dead_code)]
     pub fn put(&mut self, slot: Slot) {
 	assert!(slot < self.size);
 	let t_head_ndx: Slot = self.level_head(Self::LEVEL_FREE).into();
