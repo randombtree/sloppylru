@@ -1,7 +1,7 @@
 /// SloppyLRU cache
 /// @todo Use plain file + log for rmap transaction for faster insert speed
 use std::str;
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use futures::channel::{mpsc, oneshot};
 use futures::future::Future;
 use futures::stream::StreamExt;
@@ -126,7 +126,7 @@ where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized,
     // so this should not be run anyway; but just to be future-proof..
     if let Some(this) = this.upgrade() {
 	warn!("Shutting down flusher while cache '{}' still active..", this.name);
-	let mut rw = this.rw.write().unwrap();
+	let mut rw = this.rw.lock().unwrap();
 	// Give it back
 	rw.flusher_receiver = Some(receiver);
     }
@@ -195,7 +195,7 @@ where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized {
 	    tree,
 	    rtree,
 	    lru_tree,
-	    rw: RwLock::new(CacheConcurrent {
+	    rw: Mutex::new(CacheConcurrent {
 		lru,
 		flusher_sender,
 		flusher_receiver,
@@ -211,7 +211,7 @@ where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized {
     pub fn run<F>(&self, purger: F) -> impl Future<Output = ()>
     where F: FnMut(Vec<usize>) {
 	let receiver =  {
-	    let mut rw = self.0.rw.write().unwrap();
+	    let mut rw = self.0.rw.lock().unwrap();
 	    debug!("Starting flusher for cache '{}'", self.0.name);
 	    // Crash if run multiple times
 	    rw.flusher_receiver.take().unwrap()
@@ -262,7 +262,7 @@ where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized {
 	let slot = inner.tree.get(key.as_ref()).ok()??;
 	let slot = Slot::from(slot);
 	// Bump slot
-	let mut rw = inner.rw.write().unwrap();
+	let mut rw = inner.rw.lock().unwrap();
 	rw.lru.promote(slot, level);
 	Some(usize::from(slot))
     }
@@ -280,7 +280,7 @@ where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized
     rtree: sled::Tree,
     /// Sled sub-keyspace for lru block storage
     lru_tree: sled::Tree,
-    rw: RwLock<CacheConcurrent<N>>,
+    rw: Mutex<CacheConcurrent<N>>,
 }
 
 impl<const N: usize, const K: usize> CacheInner<N, K>
@@ -289,7 +289,7 @@ impl<const N: usize, const K: usize> CacheInner<N, K>
     // Wake flusher for GC work and wait for completion
     async fn wake_gc_sync(&self) {
 	let (sender, receiver) = oneshot::channel::<()>();
-	let mut rw = self.rw.write().unwrap();
+	let mut rw = self.rw.lock().unwrap();
 	let ret = rw.flusher_sender.try_send(FlusherMsg::GcSync(sender));
 	drop(rw);
 	// If sending fails, the queue is stuffed and we have a crash/lock in flusher
@@ -300,7 +300,7 @@ impl<const N: usize, const K: usize> CacheInner<N, K>
 
     /// Save LRU changes to DB
     fn sync(&self) -> Result<()> {
-	let mut rw = self.rw.write().unwrap();
+	let mut rw = self.rw.lock().unwrap();
 	let (lru_meta, lru_shadow) = rw.lru.checkpoint();
 	let pages = lru_shadow.as_slice();
 	if pages.len() > 0 {
@@ -319,7 +319,7 @@ impl<const N: usize, const K: usize> CacheInner<N, K>
 
     /// Transactional get LRU
     fn get_lru(&self, key: &Key<K>, level: usize) -> Result<Slot> {
-	let mut rw = self.rw.write().unwrap();
+	let mut rw = self.rw.lock().unwrap();
 	rw.lru.get(level)
 	    .ok_or(Error::LRUFull)
 	    .and_then(|slot| {
@@ -357,7 +357,7 @@ impl<const N: usize, const K: usize> CacheInner<N, K>
     /// Returns list of GC'd Slots, LRUBackoff if there is enough space in the LRU
     /// Or other error happened during the DB update.
     fn maybe_gc(&self) -> Result<Vec<Slot>> {
-	let mut rw = self.rw.write().unwrap();
+	let mut rw = self.rw.lock().unwrap();
 	rw.lru.maybe_gc()
 	    .ok_or(Error::LRUBackoff)
 	    .and_then(|list| {
@@ -420,7 +420,7 @@ where [(); 14 - N]: Sized, [(); N + 3]: Sized, [(); N + 2]: Sized
 	    error!("Unable to sync LRU to disk on closing: {:?}", e);
 	}
 	// Shut down flusher
-	let mut rw = self.rw.write().unwrap();
+	let mut rw = self.rw.lock().unwrap();
 	if let Err(_) = rw.flusher_sender.try_send(FlusherMsg::SHUTDOWN) {
 	    error!("Cache ({}) couldn't shutdown flusher", self.name);
 	}
