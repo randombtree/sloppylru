@@ -250,4 +250,27 @@ mod tests {
 	    join!(flusher, flusher2);
 	});
     }
+
+    #[test]
+    fn test_manager_reload() {
+	smol::block_on(async {
+	    let db_path = TestPath::new("test_manager_reload").unwrap();
+	    let manager = open_manager(&db_path).unwrap();
+	    let (cache, flusher) = open_cache(&manager, "my_cache", |_| {}).await;
+	    let key = gen_key();
+	    let slot = cache.insert(&key, 1).await.unwrap();
+	    drop(cache);
+	    flusher.await;
+	    drop(manager);
+
+	    // Re-open manager
+	    let manager = open_manager(&db_path).unwrap();
+	    let (cache, flusher) = open_cache(&manager, "my_cache", |_| {}).await;
+	    let same_slot = cache.get(&key, None).unwrap();
+	    assert!(slot == same_slot);
+
+	    drop(cache);
+	    flusher.await;
+	});
+    }
 }
