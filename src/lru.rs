@@ -887,28 +887,31 @@ where
 
 	let user_level    = Self::LEVEL_USER_START + level;
 	let free_head_ndx = self.level_head(Self::LEVEL_FREE);
-	let free_head     = self.items[free_head_ndx];
+	let level_head_ndx= self.level_head(user_level);
+	let mut items     = self.items.get_locked_mut();
+	let free_head     = items[free_head_ndx];
 	let slot          = free_head.prev();                   // <- Our slot
 	let slot_ndx: usize = slot.into();
-	let slot_item     = self.items[usize::from(slot)];
+	let slot_item     = items[usize::from(slot)];
 	let new_last_ndx:usize  = slot_item.prev().into();
 
 	// Update "new last" (if allocated == 0, this is the head)
-	self.items[new_last_ndx]
+	items[new_last_ndx]
 	    .set_next(free_head_ndx.into());
 
 	// Update free head
-	self.items[free_head_ndx]
+	items[free_head_ndx]
 	    .set_prev(new_last_ndx.into());
 
 	// Update user level head
-	let level_head_ndx = self.level_head(user_level);
-	let level_head = self.items[level_head_ndx];
+	let level_head = items[level_head_ndx];
 	let next_slot_ndx: usize = level_head.next().into();
-	self.items[next_slot_ndx]
+	items[next_slot_ndx]
 	    .set_prev(slot);
-	let  [slot_item, level_head] = self.items.take_refs_mut([slot_ndx, level_head_ndx]);
-	level_head.set_next(slot);
+	name_index!(slot_item, items, slot_ndx);
+	name_index!(level_head, items, level_head_ndx);
+	level_head!().set_next(slot);
+	let slot_item = &mut slot_item!();
 	slot_item.set_next(next_slot_ndx.into());
 	slot_item.set_prev(level_head_ndx.into());
 	slot_item.set_level(user_level.try_into().unwrap()); // Compile time constraint makes this always work!
